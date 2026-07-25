@@ -1,4 +1,13 @@
-import { getWorkerRoute } from "@ramideltoro/nutsnews-worker-contracts";
+import {
+  STAGE_PAYLOAD_SCHEMA_IDS,
+  STAGE_PAYLOAD_SCHEMA_VERSION,
+  WORKER_DELIVERY_BEHAVIOR,
+  assertWorkerEnvelope,
+  getStagePayloadSizeBytes,
+  getWorkerRoute,
+  validateStagePayload,
+  type WorkerMessageEnvelope
+} from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
   createRuntimeHealthProbeSet,
@@ -14,10 +23,20 @@ import {
 
 import type { SchedulerConfig } from "./config.js";
 import type { SchedulerDependencies } from "./dependencies.js";
+import {
+  createCryptoSchedulerIdFactory,
+  type SchedulerIdFactory
+} from "./ids.js";
+import {
+  selectDueFeeds,
+  type DueFeedDecision,
+  type FeedScheduleDecision
+} from "./scheduling.js";
 
 export interface SchedulerServiceOptions {
   readonly config: SchedulerConfig;
   readonly dependencies: SchedulerDependencies;
+  readonly idFactory?: SchedulerIdFactory;
   readonly telemetry?: RuntimeTelemetrySink;
   readonly metrics?: PrometheusRuntimeTelemetrySink;
 }
@@ -25,7 +44,12 @@ export interface SchedulerServiceOptions {
 export interface SchedulerRunOnceResult {
   readonly checkedAt: string;
   readonly dueFeedCount: number;
+  readonly scheduledCount: number;
+  readonly confirmedCount: number;
+  readonly skippedCount: number;
+  readonly failedCount: number;
   readonly shadowMode: boolean;
+  readonly decisions: readonly FeedScheduleDecision[];
 }
 
 export interface SchedulerService {
@@ -40,6 +64,7 @@ export interface SchedulerService {
 
 export function createSchedulerService(options: SchedulerServiceOptions): SchedulerService {
   const fetchRoute = getWorkerRoute("fetch");
+  const idFactory = options.idFactory ?? createCryptoSchedulerIdFactory();
   const broker = createBrokerLifecycle({
     transport: options.dependencies.brokerTransport,
     routes: [
@@ -109,7 +134,114 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
       return drain.track(async () => {
         options.metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
         const checkedAt = runtimeNow(options.dependencies.clock);
-        const dueFeedCount = await options.dependencies.feedSource.countDueFeeds(options.dependencies.clock.now());
+        const now = options.dependencies.clock.now();
+        const feeds = await options.dependencies.feedSource.listActiveFeeds(now);
+        const selection = selectDueFeeds(feeds, now, options.config.concurrency);
+        let scheduledCount = 0;
+        let confirmedCount = 0;
+        let failedCount = 0;
+
+        for (const decision of selection.skipped) {
+          await emitRuntimeTelemetry(options.telemetry, {
+            name: "runtime.dependency.observed",
+            level: "info",
+            at: checkedAt,
+            stage: "fetch",
+            queue: fetchRoute.mainQueue.name,
+            outcome: "success",
+            attributes: {
+              event: "scheduler.feed.skipped",
+              feedId: decision.feed.feedId,
+              reason: decision.reason,
+              nextEligibleAt: decision.nextEligibleAt
+            }
+          });
+        }
+
+        for (const decision of selection.due) {
+          const leaseResult = await options.dependencies.leaseStore.acquire({
+            feedId: decision.feed.feedId,
+            idempotencyKey: decision.idempotencyKey,
+            window: decision.window,
+            now,
+            leaseMs: options.config.leaseMs
+          });
+
+          if (leaseResult.status !== "acquired") {
+            await emitRuntimeTelemetry(options.telemetry, {
+              name: "runtime.dependency.observed",
+              level: "info",
+              at: checkedAt,
+              stage: "fetch",
+              queue: fetchRoute.mainQueue.name,
+              outcome: "duplicate",
+              attributes: {
+                event: "scheduler.feed.lease_skipped",
+                feedId: decision.feed.feedId,
+                reason: leaseResult.status,
+                windowStart: decision.window.start
+              }
+            });
+            continue;
+          }
+
+          scheduledCount += 1;
+          await emitRuntimeTelemetry(options.telemetry, {
+            name: "runtime.dependency.observed",
+            level: "info",
+            at: checkedAt,
+            stage: "fetch",
+            queue: fetchRoute.mainQueue.name,
+            outcome: "started",
+            attributes: {
+              event: "scheduler.feed.leased",
+              feedId: decision.feed.feedId,
+              windowStart: decision.window.start,
+              attemptCount: leaseResult.record.attemptCount
+            }
+          });
+
+          try {
+            const command = createFetchPublishCommand(decision, idFactory, options.config, checkedAt);
+            const receipt = await broker.publish(command);
+            await options.dependencies.leaseStore.markConfirmed(leaseResult.record.token, options.dependencies.clock.now(), receipt.messageId);
+            confirmedCount += 1;
+            await emitRuntimeTelemetry(options.telemetry, {
+              name: "runtime.message.accepted",
+              level: "info",
+              at: runtimeNow(options.dependencies.clock),
+              stage: "fetch",
+              queue: fetchRoute.mainQueue.name,
+              messageId: command.envelope.messageId,
+              idempotencyKey: command.envelope.idempotencyKey,
+              correlationId: command.envelope.correlationId,
+              traceparent: command.envelope.traceparent,
+              outcome: "success",
+              attributes: {
+                event: "scheduler.feed.confirmed",
+                feedId: decision.feed.feedId,
+                windowStart: decision.window.start
+              }
+            });
+          } catch (error: unknown) {
+            failedCount += 1;
+            await options.dependencies.leaseStore.markFailed(leaseResult.record.token, options.dependencies.clock.now(), classifyScheduleError(error));
+            await emitRuntimeTelemetry(options.telemetry, {
+              name: "runtime.dependency.observed",
+              level: "error",
+              at: runtimeNow(options.dependencies.clock),
+              stage: "fetch",
+              queue: fetchRoute.mainQueue.name,
+              outcome: "failure",
+              attributes: {
+                event: "scheduler.feed.failed",
+                feedId: decision.feed.feedId,
+                windowStart: decision.window.start,
+                error: classifyScheduleError(error)
+              }
+            });
+          }
+        }
 
         await emitRuntimeTelemetry(options.telemetry, {
           name: "runtime.dependency.observed",
@@ -119,8 +251,13 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
           queue: fetchRoute.mainQueue.name,
           outcome: "success",
           attributes: {
-            dependency: "feed-source",
-            dueFeedCount,
+            event: "scheduler.run.completed",
+            dependency: "scheduler",
+            dueFeedCount: selection.due.length,
+            scheduledCount,
+            confirmedCount,
+            failedCount,
+            skippedCount: selection.skipped.length,
             shadowMode: options.config.shadowMode
           }
         });
@@ -130,8 +267,13 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
 
         return {
           checkedAt,
-          dueFeedCount,
-          shadowMode: options.config.shadowMode
+          dueFeedCount: selection.due.length,
+          scheduledCount,
+          confirmedCount,
+          skippedCount: selection.skipped.length,
+          failedCount,
+          shadowMode: options.config.shadowMode,
+          decisions: selection.decisions
         };
       });
     },
@@ -150,6 +292,99 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
   } satisfies SchedulerService;
 
   return service;
+}
+
+function createFetchPublishCommand(
+  decision: DueFeedDecision,
+  idFactory: SchedulerIdFactory,
+  config: SchedulerConfig,
+  producedAt: string
+): {
+  readonly envelope: WorkerMessageEnvelope;
+  readonly payload: Readonly<Record<string, unknown>>;
+} {
+  const route = getWorkerRoute("fetch");
+  const messageId = idFactory.uuid();
+  const correlationId = idFactory.uuid();
+  const pipelineRunId = idFactory.uuid();
+  const stageExecutionId = idFactory.uuid();
+  const traceparent = idFactory.traceparent();
+  const payload = {
+    schemaId: STAGE_PAYLOAD_SCHEMA_IDS.feedFetchRequest,
+    schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+    pipelineRunId,
+    stageExecutionId,
+    sourceMessageId: messageId,
+    idempotencyKey: decision.idempotencyKey,
+    traceparent,
+    producedAt,
+    feedId: decision.feed.feedId,
+    feedUrl: decision.feed.feedUrl,
+    shardIndex: decision.feed.shardIndex,
+    shardCount: decision.feed.shardCount,
+    fetchReason: "scheduled",
+    ...(decision.feed.conditional === undefined ? {} : {
+      conditional: decision.feed.conditional
+    }),
+    limits: {
+      timeoutMs: decision.feed.limits?.timeoutMs ?? 15_000,
+      maxItems: decision.feed.limits?.maxItems ?? 35,
+      scheduleWindowStart: decision.window.start,
+      scheduleWindowEnd: decision.window.end,
+      priority: decision.feed.priority
+    }
+  } as const;
+  const payloadValidation = validateStagePayload(payload);
+
+  if (!payloadValidation.ok) {
+    throw new Error(`Invalid feed fetch payload: ${payloadValidation.issues.map((issue) => `${issue.path}:${issue.code}`).join(",")}`);
+  }
+
+  const envelope = assertWorkerEnvelope({
+    schemaId: route.schemaId,
+    schemaVersion: 1,
+    route: "fetch",
+    messageId,
+    causationId: messageId,
+    correlationId,
+    traceparent,
+    idempotencyKey: decision.idempotencyKey,
+    aggregate: {
+      type: "feed",
+      id: decision.feed.feedId,
+      version: 1
+    },
+    occurredAt: producedAt,
+    attempt: {
+      count: 1,
+      max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+      firstAttemptAt: producedAt
+    },
+    producer: {
+      name: "scheduler",
+      version: config.serviceVersion,
+      instanceId: config.host
+    },
+    payloadRef: {
+      kind: "backend-record",
+      uri: `backend://worker-uplift/scheduler/${encodeURIComponent(decision.idempotencyKey)}`,
+      mediaType: "application/json",
+      sizeBytes: getStagePayloadSizeBytes(payload)
+    }
+  });
+
+  return {
+    envelope,
+    payload
+  };
+}
+
+function classifyScheduleError(error: unknown): string {
+  if (error instanceof Error && error.name.length > 0) {
+    return error.name;
+  }
+
+  return "unknown-scheduler-error";
 }
 
 function livenessCheck(): RuntimeHealthCheck {

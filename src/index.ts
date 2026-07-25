@@ -40,8 +40,27 @@ export {
   LocalBrokerTransport,
   ManualSchedulerClock,
   createLocalFeedSource,
+  createLocalDueFeeds,
   createLocalSchedulerDependencies
 } from "./test-doubles.js";
+export {
+  InMemoryScheduleLeaseStore,
+  type ScheduleLeaseRecord,
+  type ScheduleLeaseStore
+} from "./lease-store.js";
+export {
+  evaluateFeedSchedule,
+  idempotencyKeyFor,
+  scheduleWindowFor,
+  selectDueFeeds,
+  type SchedulerFeedDefinition,
+  type FeedScheduleDecision
+} from "./scheduling.js";
+export {
+  SequenceSchedulerIdFactory,
+  createCryptoSchedulerIdFactory,
+  type SchedulerIdFactory
+} from "./ids.js";
 
 export interface SchedulerApplication {
   readonly config: SchedulerConfig;

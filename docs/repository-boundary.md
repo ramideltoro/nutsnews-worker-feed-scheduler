@@ -48,5 +48,4 @@ This repository currently owns the deployable shell for the scheduler stage:
 - graceful shutdown using the shared runtime drain controller;
 - local broker, clock, and feed-source doubles for deterministic tests;
 - shadow-mode enforcement so this service cannot cut over legacy ingestion by configuration alone.
-
-Due-feed scheduling decisions and fetch-work publishing behavior are intentionally deferred to the scheduler implementation issue.
+- due-feed scheduling decisions, idempotent schedule-window leases, contract-valid fetch-work publication, and publisher-confirm finalization.
