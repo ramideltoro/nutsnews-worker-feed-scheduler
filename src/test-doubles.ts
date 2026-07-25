@@ -66,6 +66,9 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
   readonly assertedRoutes: WorkerRoute[] = [];
   readonly inFlightDeliveryCount = 0;
   failPublishes = false;
+  publishError: Error | undefined;
+  publishGate: Promise<void> | undefined;
+  onPublishStart: (() => void) | undefined;
   private connected = false;
   private closed = false;
 
@@ -85,21 +88,33 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
       throw new Error("Local broker transport is not connected.");
     }
 
+    this.onPublishStart?.();
+
+    return this.publishAfterGate(command);
+  }
+
+  private async publishAfterGate(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
+    await this.publishGate;
+
+    if (this.publishError !== undefined) {
+      throw this.publishError;
+    }
+
     if (this.failPublishes) {
-      return Promise.reject(new Error("local publish failure"));
+      throw new Error("local publish failure");
     }
 
     this.published.push(command);
     const route = getWorkerRoute(command.envelope.route);
 
-    return Promise.resolve({
+    return {
       messageId: command.envelope.messageId,
       stage: command.envelope.route,
       exchange: route.exchange,
       routingKey: route.routingKey,
       confirmed: true,
       confirmedAt: command.envelope.occurredAt
-    });
+    };
   }
 
   consume(stage: WorkerStage, _handler: BrokerDeliveryHandler): Promise<{ readonly stage: WorkerStage; cancel(): Promise<void> }> {

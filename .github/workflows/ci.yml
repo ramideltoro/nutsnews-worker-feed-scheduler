@@ -15,6 +15,32 @@ jobs:
     name: validate
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: scheduler_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d scheduler_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      SCHEDULER_INTEGRATION_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/scheduler_test
+      SCHEDULER_INTEGRATION_RABBITMQ_URL: amqp://guest:guest@localhost:5672
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1

@@ -36,6 +36,7 @@
     "sbom": "npm sbom --sbom-format=cyclonedx > nutsnews-worker-feed-scheduler.sbom.json",
     "audit:prod": "npm audit --omit=dev --audit-level=high",
     "container:build": "docker build --pull=false --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-feed-scheduler:local .",
+    "smoke:shadow": "npm run build && node dist/src/shadow-smoke.js",
     "ci": "npm run lint && npm run typecheck && npm run test && npm run test:integration && npm run build && npm run sbom && npm run audit:prod"
   },
   "dependencies": {
@@ -44,8 +45,12 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",
+    "@types/amqplib": "^0.10.8",
     "@types/node": "^24.1.0",
+    "@types/pg": "^8.20.0",
+    "amqplib": "^2.0.1",
     "eslint": "^9.32.0",
+    "pg": "^8.22.0",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
     "vitest": "^3.2.4"
