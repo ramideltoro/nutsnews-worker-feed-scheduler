@@ -436,8 +436,19 @@ class RabbitMqTestTransport implements RuntimeBrokerTransport {
   }
 
   async close(): Promise<void> {
-    await this.channel?.close();
-    await this.connection?.close();
+    const channel = this.channel;
+    const connection = this.connection;
+
+    this.channel = undefined;
+    this.connection = undefined;
+
+    if (channel !== undefined) {
+      await closeRabbitMqResource(() => channel.close());
+    }
+
+    if (connection !== undefined) {
+      await closeRabbitMqResource(() => connection.close());
+    }
   }
 
   async queueMessageCount(): Promise<number> {
@@ -452,4 +463,18 @@ class RabbitMqTestTransport implements RuntimeBrokerTransport {
 
     return this.channel;
   }
+}
+
+async function closeRabbitMqResource(close: () => Promise<void>): Promise<void> {
+  try {
+    await close();
+  } catch (error: unknown) {
+    if (!isRabbitMqAlreadyClosedError(error)) {
+      throw error;
+    }
+  }
+}
+
+function isRabbitMqAlreadyClosedError(error: unknown): boolean {
+  return error instanceof Error && /(?:channel|connection) closed/i.test(error.message);
 }
