@@ -17,6 +17,10 @@ import type {
   SchedulerDependencyProbe,
   SchedulerFeedSource
 } from "./dependencies.js";
+import {
+  InMemoryScheduleLeaseStore
+} from "./lease-store.js";
+import type { SchedulerFeedDefinition } from "./scheduling.js";
 
 export class ManualSchedulerClock implements RuntimeClock {
   private current: Date;
@@ -36,11 +40,13 @@ export class ManualSchedulerClock implements RuntimeClock {
 
 export interface LocalFeedSourceOptions {
   readonly dueFeedCount?: number;
+  readonly feeds?: readonly SchedulerFeedDefinition[];
   readonly status?: SchedulerDependencyProbe["status"];
 }
 
 export function createLocalFeedSource(options: LocalFeedSourceOptions = {}): SchedulerFeedSource {
   const dueFeedCount = options.dueFeedCount ?? 0;
+  const feeds = options.feeds ?? createLocalDueFeeds(dueFeedCount);
   const status = options.status ?? "ok";
 
   return {
@@ -49,6 +55,7 @@ export function createLocalFeedSource(options: LocalFeedSourceOptions = {}): Sch
       status,
       summary: status === "ok" ? "local test feed source ready" : "local test feed source degraded"
     }),
+    listActiveFeeds: () => feeds,
     countDueFeeds: () => dueFeedCount
   };
 }
@@ -58,6 +65,7 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
   readonly published: BrokerPublishCommand[] = [];
   readonly assertedRoutes: WorkerRoute[] = [];
   readonly inFlightDeliveryCount = 0;
+  failPublishes = false;
   private connected = false;
   private closed = false;
 
@@ -75,6 +83,10 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
   publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
     if (!this.connected || this.closed) {
       throw new Error("Local broker transport is not connected.");
+    }
+
+    if (this.failPublishes) {
+      return Promise.reject(new Error("local publish failure"));
     }
 
     this.published.push(command);
@@ -113,8 +125,31 @@ export function createLocalSchedulerDependencies(options: LocalFeedSourceOptions
   return {
     clock: new ManualSchedulerClock(),
     feedSource: createLocalFeedSource(options),
+    leaseStore: new InMemoryScheduleLeaseStore(),
     brokerTransport: new LocalBrokerTransport()
   };
+}
+
+export function createLocalDueFeeds(count: number): readonly SchedulerFeedDefinition[] {
+  return Array.from({
+    length: count
+  }, (_value, index) => {
+    const feedNumber = index + 1;
+
+    return {
+      feedId: `feed-${String(feedNumber)}`,
+      feedUrl: `https://feeds.example.test/feed-${String(feedNumber)}.xml`,
+      enabled: true,
+      cadenceMs: 60_000,
+      priority: count - index,
+      shardIndex: index,
+      shardCount: Math.max(1, count),
+      limits: {
+        timeoutMs: 15_000,
+        maxItems: 35
+      }
+    };
+  });
 }
 
 export function createMinimalFetchEnvelope(overrides: Partial<WorkerMessageEnvelope> = {}): WorkerMessageEnvelope {

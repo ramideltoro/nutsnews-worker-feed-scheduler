@@ -2,7 +2,7 @@
 
 ## Scope
 
-The feed scheduler owns the first worker-uplift service boundary. It will eventually lease due feed definitions and publish fetch work to the contracted `fetch` route. The bootstrap shell does not implement scheduling business logic yet; it establishes the deployable runtime surface that #93 can fill in.
+The feed scheduler owns the first worker-uplift service boundary. It leases due feed definitions and publishes fetch work to the contracted `fetch` route. Production dependency adapters remain backend-owned; this repository owns the service-local scheduling rules, lease contract, message creation, and tests.
 
 ## Runtime Surfaces
 
@@ -12,6 +12,20 @@ The feed scheduler owns the first worker-uplift service boundary. It will eventu
 - Health: separate liveness, startup, and readiness probes
 - Metrics: bounded Prometheus text from the shared runtime sink
 - Shutdown: stop accepting work, wait for in-flight operations, close broker lifecycle
+
+## Scheduling Flow
+
+1. Load active feed definitions from the configured feed source.
+2. Evaluate disabled state, backoff state, cadence, and next eligible time with the injected clock.
+3. Calculate a stable schedule window from the feed cadence.
+4. Build the idempotency key for `feed/window`.
+5. Acquire the schedule lease before publishing.
+6. Create and validate a `feedFetchRequest` payload and worker envelope.
+7. Publish through the runtime broker lifecycle.
+8. Mark the lease `confirmed` only after the broker returns a publisher-confirm receipt.
+9. Mark failed publishes as retryable failures so the same window can be retried.
+
+Confirmed windows are not republished. Active leases suppress duplicate concurrent scheduling until the lease expires.
 
 ## Dependency Boundary
 
@@ -26,3 +40,5 @@ The repository includes deterministic local doubles for:
 - feed source.
 
 These doubles let the empty service start, become ready, expose metrics, and drain cleanly without production dependencies or legacy worker code.
+
+The in-memory lease store also models confirmed, failed, and active-lease behavior for replay/crash-safety tests.

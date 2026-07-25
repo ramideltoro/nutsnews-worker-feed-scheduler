@@ -6,7 +6,7 @@ Deployable worker-uplift feed scheduler service shell for NutsNews.
 
 Own the scheduler service boundary that will read active feed definitions, decide which feeds are due, and publish validated fetch work without touching legacy ingestion.
 
-Issue #92 bootstraps the deployable shell only. It wires exact worker contracts/runtime package versions, health and metrics endpoints, graceful shutdown, local dependency doubles, and CI/container gates. Due-feed scheduling and publish-confirm business behavior remain scoped to the follow-up scheduler implementation issue.
+Issue #92 bootstrapped the deployable shell. Issue #93 adds due-feed selection, idempotent schedule-window leasing, contract-valid fetch request publication, and confirmation-only finalization.
 
 ## Owner
 
@@ -50,6 +50,22 @@ Important variables:
 - `NUTSNEWS_SCHEDULER_SHADOW_MODE`
 
 `NUTSNEWS_SCHEDULER_SHADOW_MODE` must remain `true` until backend-owned cutover work explicitly changes the deployment contract.
+
+## Scheduling Behavior
+
+The scheduler evaluates active feed definitions with an injectable clock:
+
+- disabled feeds are skipped with reason `disabled`;
+- feeds in backoff are skipped with reason `backoff`;
+- feeds whose cadence has not elapsed are skipped with reason `not_due`;
+- due feeds are ordered by priority, then feed ID;
+- each feed/window uses a stable idempotency key: `scheduler:feed:<feed-id>:<window>`;
+- the lease store is acquired before RabbitMQ publish;
+- the lease is finalized as `confirmed` only after publisher confirmation;
+- failed publishes mark the lease `failed`, allowing a later retry;
+- already confirmed windows are not published again.
+
+Published fetch requests validate against `@ramideltoro/nutsnews-worker-contracts@0.3.1`. Schedule-window metadata is carried inside the payload `limits` object while correlation and idempotency live on the worker envelope.
 
 ## Development
 
