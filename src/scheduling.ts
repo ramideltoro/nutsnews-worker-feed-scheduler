@@ -160,8 +160,23 @@ function slugify(value: string): string {
   const slug = value
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9._:/-]+/gu, "-")
-    .replace(/^-+|-+$/gu, "");
+    .replace(/[^a-z0-9._:/-]+/gu, "-");
+  const trimmed = trimHyphens(slug);
 
-  return slug.length > 0 ? slug.slice(0, 120) : "unknown";
+  return trimmed.length > 0 ? trimmed.slice(0, 120) : "unknown";
+}
+
+function trimHyphens(value: string): string {
+  let start = 0;
+  let end = value.length;
+
+  while (start < end && value[start] === "-") {
+    start += 1;
+  }
+
+  while (end > start && value[end - 1] === "-") {
+    end -= 1;
+  }
+
+  return value.slice(start, end);
 }
