@@ -2,7 +2,7 @@
 
 Image: `ghcr.io/ramideltoro/nutsnews-worker-feed-scheduler:<commit-sha>`
 
-The publish workflow signs and pushes immutable SHA-tagged images after implementation adds a Dockerfile. It does not publish mutable `latest` tags.
+The publish workflow validates the service, builds a non-root multi-stage image, produces build provenance/SBOM metadata, signs the image with keyless cosign, and pushes immutable SHA-tagged images. It does not publish mutable `latest` tags.
 
 The intended production package consumer is:
 

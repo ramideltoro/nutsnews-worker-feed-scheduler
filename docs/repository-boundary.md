@@ -5,7 +5,7 @@
 | Repository | `ramideltoro/nutsnews-worker-feed-scheduler` |
 | Owner | `@ramideltoro` |
 | Responsibility | Read active feed definitions, decide which feeds are due, and publish validated rss.feed.fetch messages without touching legacy ingestion. |
-| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-feed-scheduler` after implementation work adds a Dockerfile. |
+| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-feed-scheduler`. |
 | Primary artifact | Signed GHCR image tagged only by commit SHA |
 | Support boundary | Repo-local code, tests, CI, package/image publishing, and service-local run notes. |
 | Outside boundary | Backend host runtime/deployments, Grafana Cloud resources, explanatory architecture/operations docs, production secrets, legacy ingestion. |
@@ -26,7 +26,8 @@
 - Default Actions token permission: read-only.
 - Publish workflows request package write permission only inside publish jobs.
 - CI validates repo boundary docs on every push and pull request.
-- CodeQL and dependency review workflows are present for future code-bearing changes.
+- CI runs lint, type checks, unit tests, integration tests, build, SBOM generation, production dependency audit, and local container build.
+- CodeQL and dependency review workflows are present for code-bearing changes.
 - Dependabot checks GitHub Actions and npm manifests.
 - Branch protection requires pull requests, resolved conversations, and the `validate` status check where GitHub permits repository branch protection. CODEOWNERS documents ownership for reviews.
 
@@ -37,3 +38,15 @@ Some GitHub package access controls can be applied only after the first package 
 - Package repos publish exact versions to GitHub Packages. Downstream repos install through `GITHUB_TOKEN` with `packages: read`.
 - Service repos publish signed, immutable SHA-tagged images to GHCR. Backend production deploys pull through `ramideltoro/nutsnews-backend/.github/workflows/protected-backend-ansible-apply.yml` only.
 - App repos must not define production environments or store production runtime secrets.
+
+## Scheduler Shell
+
+This repository currently owns the deployable shell for the scheduler stage:
+
+- exact package pins to `@ramideltoro/nutsnews-worker-contracts@0.3.1` and `@ramideltoro/nutsnews-worker-runtime@0.4.0`;
+- liveness, startup, readiness, metrics, and value-free config-schema endpoints;
+- graceful shutdown using the shared runtime drain controller;
+- local broker, clock, and feed-source doubles for deterministic tests;
+- shadow-mode enforcement so this service cannot cut over legacy ingestion by configuration alone.
+
+Due-feed scheduling decisions and fetch-work publishing behavior are intentionally deferred to the scheduler implementation issue.
