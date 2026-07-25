@@ -27,6 +27,24 @@ The feed scheduler owns the first worker-uplift service boundary. It leases due 
 
 Confirmed windows are not republished. Active leases suppress duplicate concurrent scheduling until the lease expires.
 
+## Concurrency and Recovery
+
+The scheduler treats the schedule-window idempotency key as the cross-replica lock boundary. A replica must acquire the lease before it publishes fetch work, and it finalizes the lease only after the broker returns a publisher-confirm receipt.
+
+The local proof suite exercises simultaneous acquire attempts, stale lease recovery, clock boundaries, UTC/DST behavior, lease-store failures, broker failures, confirm timeouts, and shutdown during an in-flight publish without wall-clock sleeps. Integration tests run the same service path against PostgreSQL and RabbitMQ when `SCHEDULER_INTEGRATION_POSTGRES_URL` and `SCHEDULER_INTEGRATION_RABBITMQ_URL` are configured.
+
+GitHub Actions starts PostgreSQL and RabbitMQ service containers for CI, so concurrent replicas must produce at most one confirmed schedule-window claim and at most one RabbitMQ message for the tested window. Stale leases recover after the configured lease duration when the injected clock advances beyond the lease expiry.
+
+Failure telemetry includes the feed, window, attempt count when available, idempotency key for lease-store failures, and the dependency label. It does not include connection strings, tokens, URLs from secret configuration, or message bodies.
+
+The deterministic shadow smoke command uses fixture feeds and local doubles:
+
+```sh
+npm run smoke:shadow
+```
+
+The command returns a compact JSON summary suitable for operator smoke checks before production adapters are wired.
+
 ## Dependency Boundary
 
 Production database, backend API, RabbitMQ, and telemetry credentials stay outside this repository. The service stores only whether dependency variables are configured, not the secret values themselves. Backend-owned deployment configuration supplies real values later.

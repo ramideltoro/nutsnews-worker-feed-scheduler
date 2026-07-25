@@ -92,4 +92,23 @@ describe("feed scheduling decisions", () => {
       "feed-b"
     ]);
   });
+
+  it("uses UTC windows across daylight-saving boundaries", () => {
+    const beforeDstJump = scheduleWindowFor(baseFeed, new Date("2026-03-08T06:59:59.999Z"));
+    const afterDstJump = scheduleWindowFor(baseFeed, new Date("2026-03-08T07:00:00.000Z"));
+    const fallBackBoundary = scheduleWindowFor(baseFeed, new Date("2026-11-01T05:59:59.999Z"));
+
+    expect(beforeDstJump).toMatchObject({
+      start: "2026-03-08T06:59:00.000Z",
+      end: "2026-03-08T07:00:00.000Z"
+    });
+    expect(afterDstJump).toMatchObject({
+      start: "2026-03-08T07:00:00.000Z",
+      end: "2026-03-08T07:01:00.000Z"
+    });
+    expect(fallBackBoundary).toMatchObject({
+      start: "2026-11-01T05:59:00.000Z",
+      end: "2026-11-01T06:00:00.000Z"
+    });
+  });
 });

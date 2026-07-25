@@ -15,6 +15,10 @@ import { loadSchedulerConfig } from "../src/config.js";
 import type { SchedulerDependencies } from "../src/dependencies.js";
 import { SequenceSchedulerIdFactory } from "../src/ids.js";
 import { InMemoryScheduleLeaseStore } from "../src/lease-store.js";
+import type {
+  ScheduleLeaseAcquireCommand,
+  ScheduleLeaseStore
+} from "../src/lease-store.js";
 import { createSchedulerService } from "../src/service.js";
 import type { SchedulerFeedDefinition } from "../src/scheduling.js";
 import {
@@ -112,6 +116,73 @@ describe("scheduler publish flow", () => {
     await context.service.stop();
   });
 
+  it("records confirm timeout as retryable broker failure telemetry", async () => {
+    const context = createServiceContext();
+    const timeout = new Error("publisher confirm timed out");
+
+    timeout.name = "ConfirmTimeoutError";
+    context.broker.publishError = timeout;
+
+    await context.service.start();
+    const result = await context.service.runOnce();
+
+    expect(result).toMatchObject({
+      scheduledCount: 1,
+      confirmedCount: 0,
+      failedCount: 1
+    });
+    expect(context.telemetry.events.some((event) => event.attributes?.dependency === "broker" && event.attributes.error === "ConfirmTimeoutError")).toBe(true);
+
+    await context.service.stop();
+  });
+
+  it("emits bounded lease-store failure telemetry when the database dependency is unavailable", async () => {
+    const context = createServiceContext(undefined, new FailingLeaseStore());
+
+    await context.service.start();
+    const result = await context.service.runOnce();
+
+    expect(result).toMatchObject({
+      dueFeedCount: 1,
+      scheduledCount: 0,
+      confirmedCount: 0,
+      failedCount: 1
+    });
+    expect(context.telemetry.events.some((event) =>
+      event.attributes?.dependency === "lease-store" &&
+      event.attributes.feedId === "feed-world" &&
+      event.attributes.windowStart === "2026-07-23T00:05:00.000Z"
+    )).toBe(true);
+
+    await context.service.stop();
+  });
+
+  it("waits for an in-flight publish during shutdown without wall-clock sleeps", async () => {
+    const context = createServiceContext();
+    const gate = deferred<undefined>();
+    const started = deferred<undefined>();
+
+    context.broker.publishGate = gate.promise;
+    context.broker.onPublishStart = () => {
+      started.resolve(undefined);
+    };
+
+    await context.service.start();
+    const run = context.service.runOnce();
+    await started.promise;
+    const stop = context.service.stop();
+
+    expect(context.service.isDraining).toBe(true);
+    expect(context.broker.published).toHaveLength(0);
+
+    gate.resolve(undefined);
+    await run;
+    await stop;
+
+    expect(context.broker.published).toHaveLength(1);
+    expect(context.service.isStarted).toBe(false);
+  });
+
   it("emits observable skip telemetry for disabled, backoff, and not-due feeds", async () => {
     const context = createServiceContext([
       {
@@ -160,7 +231,7 @@ describe("scheduler publish flow", () => {
   });
 });
 
-function createServiceContext(feeds: readonly SchedulerFeedDefinition[] = [
+function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefined = [
   {
     feedId: "feed-world",
     feedUrl: "https://feeds.example.test/world.xml",
@@ -174,7 +245,7 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] = [
       maxItems: 35
     }
   }
-]) {
+], leaseStore: ScheduleLeaseStore = new InMemoryScheduleLeaseStore()) {
   const config = loadSchedulerConfig({
     NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent",
     NUTSNEWS_SCHEDULER_LEASE_MS: "300000",
@@ -187,7 +258,7 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] = [
     feedSource: createLocalFeedSource({
       feeds
     }),
-    leaseStore: new InMemoryScheduleLeaseStore(),
+    leaseStore,
     brokerTransport: broker
   };
   const telemetry = createBufferedRuntimeTelemetrySink();
@@ -204,5 +275,51 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] = [
     dependencies,
     service,
     telemetry
+  };
+}
+
+class FailingLeaseStore implements ScheduleLeaseStore {
+  acquire(_command: ScheduleLeaseAcquireCommand): Promise<never> {
+    void _command;
+    const error = new Error("database unavailable");
+    error.name = "DatabaseUnavailableError";
+    return Promise.reject(error);
+  }
+
+  markConfirmed(): Promise<never> {
+    return Promise.reject(new Error("not implemented"));
+  }
+
+  markFailed(): Promise<never> {
+    return Promise.reject(new Error("not implemented"));
+  }
+
+  get(): Promise<undefined> {
+    return Promise.resolve(undefined);
+  }
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolveValue: ((value: T) => void) | undefined;
+  let rejectValue: ((error: unknown) => void) | undefined;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolveValue = resolve;
+    rejectValue = reject;
+  });
+
+  return {
+    promise,
+    resolve: (value) => {
+      resolveValue?.(value);
+    },
+    reject: (error) => {
+      rejectValue?.(error);
+    }
   };
 }

@@ -44,6 +44,10 @@ export {
   createLocalSchedulerDependencies
 } from "./test-doubles.js";
 export {
+  SCHEDULER_FIXTURE_FEEDS,
+  SCHEDULER_FIXTURE_NOW
+} from "./fixtures.js";
+export {
   InMemoryScheduleLeaseStore,
   type ScheduleLeaseRecord,
   type ScheduleLeaseStore

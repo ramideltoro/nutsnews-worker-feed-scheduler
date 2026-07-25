@@ -159,13 +159,12 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         }
 
         for (const decision of selection.due) {
-          const leaseResult = await options.dependencies.leaseStore.acquire({
-            feedId: decision.feed.feedId,
-            idempotencyKey: decision.idempotencyKey,
-            window: decision.window,
-            now,
-            leaseMs: options.config.leaseMs
-          });
+          const leaseResult = await acquireScheduleLease(options, decision, now, checkedAt, fetchRoute.mainQueue.name);
+
+          if (leaseResult === undefined) {
+            failedCount += 1;
+            continue;
+          }
 
           if (leaseResult.status !== "acquired") {
             await emitRuntimeTelemetry(options.telemetry, {
@@ -195,6 +194,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
             outcome: "started",
             attributes: {
               event: "scheduler.feed.leased",
+              dependency: "lease-store",
               feedId: decision.feed.feedId,
               windowStart: decision.window.start,
               attemptCount: leaseResult.record.attemptCount
@@ -219,6 +219,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
               outcome: "success",
               attributes: {
                 event: "scheduler.feed.confirmed",
+                dependency: "broker",
                 feedId: decision.feed.feedId,
                 windowStart: decision.window.start
               }
@@ -235,8 +236,10 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
               outcome: "failure",
               attributes: {
                 event: "scheduler.feed.failed",
+                dependency: "broker",
                 feedId: decision.feed.feedId,
                 windowStart: decision.window.start,
+                attemptCount: leaseResult.record.attemptCount,
                 error: classifyScheduleError(error)
               }
             });
@@ -292,6 +295,43 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
   } satisfies SchedulerService;
 
   return service;
+}
+
+async function acquireScheduleLease(
+  options: SchedulerServiceOptions,
+  decision: DueFeedDecision,
+  now: Date,
+  checkedAt: string,
+  queueName: string
+): Promise<Awaited<ReturnType<SchedulerDependencies["leaseStore"]["acquire"]>> | undefined> {
+  try {
+    return await options.dependencies.leaseStore.acquire({
+      feedId: decision.feed.feedId,
+      idempotencyKey: decision.idempotencyKey,
+      window: decision.window,
+      now,
+      leaseMs: options.config.leaseMs
+    });
+  } catch (error: unknown) {
+    await emitRuntimeTelemetry(options.telemetry, {
+      name: "runtime.dependency.observed",
+      level: "error",
+      at: checkedAt,
+      stage: "fetch",
+      queue: queueName,
+      outcome: "failure",
+      attributes: {
+        event: "scheduler.feed.failed",
+        dependency: "lease-store",
+        feedId: decision.feed.feedId,
+        windowStart: decision.window.start,
+        idempotencyKey: decision.idempotencyKey,
+        error: classifyScheduleError(error)
+      }
+    });
+
+    return undefined;
+  }
 }
 
 function createFetchPublishCommand(

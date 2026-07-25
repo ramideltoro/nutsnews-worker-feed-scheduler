@@ -6,7 +6,7 @@ Deployable worker-uplift feed scheduler service shell for NutsNews.
 
 Own the scheduler service boundary that will read active feed definitions, decide which feeds are due, and publish validated fetch work without touching legacy ingestion.
 
-Issue #92 bootstrapped the deployable shell. Issue #93 adds due-feed selection, idempotent schedule-window leasing, contract-valid fetch request publication, and confirmation-only finalization.
+Issue #92 bootstrapped the deployable shell. Issue #93 adds due-feed selection, idempotent schedule-window leasing, contract-valid fetch request publication, and confirmation-only finalization. Issue #94 proves concurrent scheduling, recovery, dependency failure telemetry, and deterministic shadow-mode smoke behavior.
 
 ## Owner
 
@@ -67,16 +67,43 @@ The scheduler evaluates active feed definitions with an injectable clock:
 
 Published fetch requests validate against `@ramideltoro/nutsnews-worker-contracts@0.3.1`. Schedule-window metadata is carried inside the payload `limits` object while correlation and idempotency live on the worker envelope.
 
+## Concurrency and Recovery Proof
+
+The scheduler proof suite covers:
+
+- simultaneous lease attempts for the same schedule window;
+- stale lease recovery after the configured lease bound;
+- UTC, cadence, and DST-safe window boundaries;
+- lease-store outage telemetry;
+- broker outage and confirm-timeout telemetry;
+- graceful shutdown while a publish is in flight;
+- multi-replica PostgreSQL and RabbitMQ integration.
+
+Failure telemetry identifies `feedId`, `windowStart`, `attemptCount` when available, `idempotencyKey` for lease failures, and the failing dependency (`lease-store` or `broker`) without recording secret values.
+
+The PostgreSQL/RabbitMQ integration test skips unless both service URLs are present:
+
+```sh
+export SCHEDULER_INTEGRATION_POSTGRES_URL="postgres://postgres:postgres@localhost:5432/scheduler_test"
+export SCHEDULER_INTEGRATION_RABBITMQ_URL="amqp://guest:guest@localhost:5672"
+npm run test:integration
+```
+
+GitHub Actions provides PostgreSQL and RabbitMQ service containers, so the full integration runs in CI.
+
 ## Development
 
 ```sh
 export NODE_AUTH_TOKEN="<GitHub classic PAT with read:packages>"
 npm ci
 npm run ci
+npm run smoke:shadow
 docker build --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-feed-scheduler:local .
 ```
 
 `npm run ci` runs linting, strict type checking, unit tests, integration tests, build, CycloneDX SBOM generation, and a production dependency audit.
+
+`npm run smoke:shadow` builds the service and runs a deterministic fixture schedule with local test doubles. It prints a compact JSON summary with shadow-mode status, due feed count, confirmed count, skipped count, published count, and telemetry event count.
 
 ## Support Boundary
 
