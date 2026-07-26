@@ -8,7 +8,7 @@ import { createSchedulerFailClosedReconciler } from "../src/reconciliation.js";
 import { ManualSchedulerClock } from "../src/test-doubles.js";
 
 describe("scheduler reconciliation", () => {
-  it("fails closed instead of synthesizing fetch messages from partial metadata", async () => {
+  it("reports a bounded no-op dry-run when no service-owned replay candidates exist", async () => {
     const reconciler = createSchedulerFailClosedReconciler(new ManualSchedulerClock());
 
     const report = await reconciler.reconcile({
@@ -18,13 +18,13 @@ describe("scheduler reconciliation", () => {
 
     expect(report).toMatchObject({
       service: "scheduler",
-      status: "failed_closed",
+      status: "dry_run",
       selectedCount: 0,
       replayedCount: 0,
       writesPerformed: false,
       productionVisibilityEnabled: false,
       legacyRuntimeRequired: false
     });
-    expect(report.errors[0]).toContain("refusing to synthesize");
+    expect(report.errors).toEqual([]);
   });
 });
