@@ -5,6 +5,7 @@ import {
   createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
+  SYSTEM_RUNTIME_CLOCK,
   type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
@@ -14,6 +15,9 @@ import {
   type SchedulerConfig
 } from "./config.js";
 import { createSchedulerHttpServer } from "./http.js";
+import {
+  createSchedulerFailClosedReconciler
+} from "./reconciliation.js";
 import { createSchedulerService } from "./service.js";
 import { createLocalSchedulerDependencies } from "./test-doubles.js";
 
@@ -31,6 +35,14 @@ export type {
 export {
   createSchedulerHttpServer
 } from "./http.js";
+export {
+  SCHEDULER_RECONCILIATION_CONFIRMATION,
+  SCHEDULER_RECONCILIATION_PATH,
+  createSchedulerFailClosedReconciler,
+  type SchedulerReconciliationReport,
+  type SchedulerReconciliationRequest,
+  type SchedulerReconciler
+} from "./reconciliation.js";
 export {
   createSchedulerService,
   type SchedulerRunOnceResult,
@@ -94,6 +106,7 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
   const dependencies = createLocalSchedulerDependencies();
+  const reconciliationToken = reconciliationTokenFromEnv();
   const service = createSchedulerService({
     config,
     dependencies,
@@ -107,6 +120,10 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
   const httpServer = createSchedulerHttpServer({
     config,
     service,
+    reconciler: createSchedulerFailClosedReconciler(SYSTEM_RUNTIME_CLOCK),
+    ...(reconciliationToken === undefined ? {} : {
+      reconciliationToken
+    }),
     ...(metrics === undefined ? {} : {
       metrics
     })
@@ -142,6 +159,14 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
       await shutdown.trigger("manual");
     }
   };
+}
+
+function reconciliationTokenFromEnv(): string | undefined {
+  const serviceToken = process.env.NUTSNEWS_SCHEDULER_RECONCILIATION_TOKEN?.trim();
+  const globalToken = process.env.NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_TOKEN?.trim();
+  const token = serviceToken !== undefined && serviceToken.length > 0 ? serviceToken : globalToken;
+
+  return token === undefined || token.length === 0 ? undefined : token;
 }
 
 function combineTelemetrySinks(
