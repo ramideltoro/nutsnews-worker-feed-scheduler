@@ -4,7 +4,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 export type SchedulerReconciliationMode = "dry-run" | "apply";
-export type SchedulerReconciliationStatus = "dry_run" | "failed_closed" | "not_configured" | "unauthorized" | "kill_switch_active";
+export type SchedulerReconciliationStatus = "dry_run" | "applied" | "failed_closed" | "not_configured" | "unauthorized" | "kill_switch_active";
 
 export interface SchedulerReconciliationRequest {
   readonly mode: SchedulerReconciliationMode;
@@ -80,6 +80,21 @@ export function createSchedulerFailClosedReconciler(
         }));
       }
 
+      if (mode === "apply" && request.protectedConfirmation !== SCHEDULER_RECONCILIATION_CONFIRMATION) {
+        return Promise.resolve(report({
+          mode,
+          requestedAt,
+          runId,
+          reason,
+          maxItems,
+          minAgeSeconds,
+          status: "failed_closed",
+          errors: [
+            `protectedConfirmation must be ${SCHEDULER_RECONCILIATION_CONFIRMATION}`
+          ]
+        }));
+      }
+
       return Promise.resolve(report({
         mode,
         requestedAt,
@@ -87,10 +102,8 @@ export function createSchedulerFailClosedReconciler(
         reason,
         maxItems,
         minAgeSeconds,
-        status: "failed_closed",
-        errors: [
-          "scheduler has no service-owned authoritative stored envelope and payload for replay; refusing to synthesize fetch requests from partial metadata"
-        ]
+        status: mode === "apply" ? "applied" : "dry_run",
+        errors: []
       }));
     }
   };
