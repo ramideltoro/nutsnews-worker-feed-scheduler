@@ -11,8 +11,14 @@ import {
   createSchedulerHttpServer,
   type SchedulerHttpServer
 } from "../src/http.js";
+import {
+  createSchedulerFailClosedReconciler
+} from "../src/reconciliation.js";
 import { createSchedulerService } from "../src/service.js";
-import { createLocalSchedulerDependencies } from "../src/test-doubles.js";
+import {
+  ManualSchedulerClock,
+  createLocalSchedulerDependencies
+} from "../src/test-doubles.js";
 
 let activeServer: SchedulerHttpServer | undefined;
 
@@ -66,6 +72,53 @@ describe("scheduler HTTP endpoints", () => {
     const schema = await schemaResponse.json() as { readonly variables: readonly { readonly name: string; readonly sensitive: boolean }[] };
     expect(schema.variables.some((variable) => variable.name === "NUTSNEWS_SCHEDULER_RABBITMQ_URL" && variable.sensitive)).toBe(true);
     expect(JSON.stringify(schema)).not.toContain("postgres://");
+
+    await service.stop();
+  });
+
+  it("protects the reconciliation endpoint with bearer auth", async () => {
+    const config = loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_HTTP_HOST: "127.0.0.1",
+      NUTSNEWS_SCHEDULER_HTTP_PORT: "0",
+      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
+    });
+    const service = createSchedulerService({
+      config,
+      dependencies: createLocalSchedulerDependencies()
+    });
+    activeServer = createSchedulerHttpServer({
+      config,
+      service,
+      reconciler: createSchedulerFailClosedReconciler(new ManualSchedulerClock()),
+      reconciliationToken: "test-token"
+    });
+
+    await service.start();
+    await activeServer.listen();
+
+    const unauthorized = await fetch(activeServer.url("/reconcile/outbox"), {
+      method: "POST",
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const authorized = await fetch(activeServer.url("/reconcile/outbox"), {
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-token"
+      },
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(authorized.status).toBe(409);
+    await expect(authorized.json()).resolves.toMatchObject({
+      status: "failed_closed",
+      writesPerformed: false,
+      productionVisibilityEnabled: false
+    });
 
     await service.stop();
   });
