@@ -21,6 +21,7 @@ import {
   InMemoryScheduleLeaseStore
 } from "./lease-store.js";
 import type { SchedulerFeedDefinition } from "./scheduling.js";
+import { SchedulerPublishError } from "./publish-error.js";
 
 export class ManualSchedulerClock implements RuntimeClock {
   private current: Date;
@@ -111,7 +112,7 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
     }
 
     if (this.failPublishes) {
-      throw new Error("local publish failure");
+      throw new SchedulerPublishError("local publish failure", "rejected");
     }
 
     this.published.push(command);
@@ -148,14 +149,15 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
 
 export function createLocalSchedulerDependencies(options: LocalFeedSourceOptions = {}): SchedulerDependencies {
   const brokerTransport = new LocalBrokerTransport();
+  const clock = new ManualSchedulerClock();
 
   return {
     mode: "test",
     clockKind: "manual-test",
     brokerKind: "local-test",
-    clock: new ManualSchedulerClock(),
+    clock,
     feedSource: createLocalFeedSource(options),
-    leaseStore: new InMemoryScheduleLeaseStore(),
+    leaseStore: new InMemoryScheduleLeaseStore(() => clock.now()),
     brokerTransport,
     brokerProbe: brokerTransport
   };

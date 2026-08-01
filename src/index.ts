@@ -6,7 +6,7 @@ import {
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
   SYSTEM_RUNTIME_CLOCK,
-  type RuntimeTelemetrySink
+  type RuntimeServiceIdentity
 } from "@ramideltoro/nutsnews-worker-runtime";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
 
@@ -14,6 +14,7 @@ import {
   loadSchedulerConfig,
   type SchedulerConfig
 } from "./config.js";
+import type { SchedulerDependencies } from "./dependencies.js";
 import { createSchedulerHttpServer } from "./http.js";
 import { createSchedulerLoop } from "./loop.js";
 import {
@@ -22,10 +23,19 @@ import {
 import {
   createSchedulerFailClosedReconciler
 } from "./reconciliation.js";
-import { createSchedulerService } from "./service.js";
+import {
+  SCHEDULER_HEALTH_CHECK_NAMES,
+  createSchedulerService
+} from "./service.js";
+import {
+  bestEffortSchedulerMetricsSink,
+  bestEffortTelemetryFlusher
+} from "./telemetry-safety.js";
+import { createLocalSchedulerDependencies } from "./test-doubles.js";
 
 export {
   SCHEDULER_CONFIG_SCHEMA,
+  SCHEDULER_PRODUCTION_MIN_LEASE_MS,
   SCHEDULER_SERVICE_NAME,
   SCHEDULER_SERVICE_VERSION,
   loadSchedulerConfig,
@@ -57,6 +67,11 @@ export {
   type SchedulerRabbitMqPublisherOptions
 } from "./rabbitmq-publisher.js";
 export {
+  SchedulerPublishError,
+  schedulerPublishDisposition,
+  type SchedulerPublishDisposition
+} from "./publish-error.js";
+export {
   SCHEDULER_RECONCILIATION_CONFIRMATION,
   SCHEDULER_RECONCILIATION_PATH,
   createSchedulerFailClosedReconciler,
@@ -65,6 +80,8 @@ export {
   type SchedulerReconciler
 } from "./reconciliation.js";
 export {
+  SCHEDULER_CYCLE_DURATION_BUCKETS_SECONDS,
+  SCHEDULER_HEALTH_CHECK_NAMES,
   createSchedulerService,
   type SchedulerRunOnceResult,
   type SchedulerService
@@ -82,6 +99,9 @@ export {
 } from "./fixtures.js";
 export {
   InMemoryScheduleLeaseStore,
+  SCHEDULE_LEASE_MAX_MS,
+  ScheduleLeaseOwnershipError,
+  assertScheduleLeaseDuration,
   type ScheduleLeaseRecord,
   type ScheduleLeaseStore
 } from "./lease-store.js";
@@ -103,30 +123,48 @@ export interface SchedulerApplication {
   readonly config: SchedulerConfig;
   start(): Promise<void>;
   stop(): Promise<void>;
+  url(path?: string): string;
 }
 
-export function createSchedulerApplication(config = loadSchedulerConfig()): SchedulerApplication {
-  const identity = {
+export function createSchedulerApplication(
+  config = loadSchedulerConfig(),
+  dependencyOverride?: SchedulerDependencies
+): SchedulerApplication {
+  const dependencies = dependencyOverride ?? createSchedulerDependencies(config);
+  const identity: RuntimeServiceIdentity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
-    host: config.host
+    host: config.host,
+    revision: config.buildRevision,
+    deployment: config.shadowMode ? "shadow" : "production",
+    adapter: runtimeAdapterMode(dependencies)
   };
-  const logSink = config.telemetryLogs === "stdout"
+  const logSink = bestEffortTelemetryFlusher(config.telemetryLogs === "stdout"
     ? createJsonRuntimeTelemetrySink({
         identity,
         writer: (line) => {
           console.log(line);
         }
       })
-    : undefined;
-  const metrics = config.metricsEnabled
-    ? createPrometheusRuntimeTelemetrySink({
-        identity
-      })
-    : undefined;
-  const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createSchedulerDependencies(config);
+    : undefined);
+  const metricsOptions = {
+    identity,
+    cardinality: {
+      dependencies: [
+        "scheduler-shell",
+        "scheduler",
+        "lease-store",
+        "broker"
+      ],
+      healthChecks: Object.values(SCHEDULER_HEALTH_CHECK_NAMES).flat()
+    },
+    expectedActive: !config.shadowMode
+  } as const;
+  const metrics = bestEffortSchedulerMetricsSink(config.metricsEnabled
+    ? createPrometheusRuntimeTelemetrySink(metricsOptions)
+    : undefined);
+  const telemetry = logSink;
   const reconciliationToken = reconciliationTokenFromEnv();
   const service = createSchedulerService({
     config,
@@ -165,13 +203,13 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
   const shutdown = createRuntimeShutdownController({
     callbacks: [
       async () => {
-        await httpServer.close();
-      },
-      async () => {
         await schedulerLoop.stop();
       },
       async () => {
         await service.stop();
+      },
+      async () => {
+        await httpServer.close();
       }
     ],
     signalSource: process,
@@ -188,15 +226,48 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
     config,
     async start(): Promise<void> {
       assertPackageCompatibility();
-      await service.start();
       await httpServer.listen();
-      schedulerLoop.start();
       shutdown.start();
+
+      try {
+        await service.start();
+        schedulerLoop.start();
+      } catch (error: unknown) {
+        shutdown.stop();
+        await schedulerLoop.stop().catch(() => undefined);
+        await service.stop().catch(() => undefined);
+        await httpServer.close().catch(() => undefined);
+        throw error;
+      }
     },
     async stop(): Promise<void> {
       await shutdown.trigger("manual");
-    }
+    },
+    url: (path = "/") => httpServer.url(path)
   };
+}
+
+export function createSchedulerApplicationDependencies(): SchedulerDependencies {
+  return {
+    ...createLocalSchedulerDependencies(),
+    clockKind: "system",
+    clock: SYSTEM_RUNTIME_CLOCK
+  };
+}
+
+function runtimeAdapterMode(dependencies: SchedulerDependencies): "in_memory" | "mixed" | "production" {
+  const unique = new Set([
+    dependencies.clockKind === "system" ? "production" : "in_memory",
+    dependencies.feedSource.adapterKind === "backend-api" ? "production" : "in_memory",
+    dependencies.leaseStore.adapterKind === "postgres" ? "production" : "in_memory",
+    dependencies.brokerKind === "rabbitmq" ? "production" : "in_memory"
+  ]);
+
+  if (unique.size !== 1) {
+    return "mixed";
+  }
+
+  return unique.values().next().value === "production" ? "production" : "in_memory";
 }
 
 function reconciliationTokenFromEnv(): string | undefined {
@@ -207,36 +278,25 @@ function reconciliationTokenFromEnv(): string | undefined {
   return token === undefined || token.length === 0 ? undefined : token;
 }
 
-function combineTelemetrySinks(
-  ...sinks: readonly (RuntimeTelemetrySink | undefined)[]
-): RuntimeTelemetrySink | undefined {
-  const configured = sinks.filter((sink): sink is RuntimeTelemetrySink => sink !== undefined);
-
-  if (configured.length === 0) {
-    return undefined;
-  }
-
-  return {
-    emit: async (event) => {
-      for (const sink of configured) {
-        await sink.emit(event);
-      }
-    }
-  };
-}
-
 function assertPackageCompatibility(): void {
   const contracts = getContractPackageMetadata();
   const runtime = getRuntimePackageMetadata();
   const contractsVersion: string = contracts.packageVersion;
   const runtimeVersion: string = runtime.packageVersion;
+  const runtimeContractsVersion: string = runtime.contractsPackageVersion;
 
-  if (contractsVersion !== "0.3.1") {
+  if (contractsVersion !== "1.0.0") {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 
-  if (runtimeVersion !== "0.4.0") {
+  if (runtimeVersion !== "1.0.0") {
     throw new Error(`Unsupported runtime package version ${runtimeVersion}.`);
+  }
+
+  if (runtimeContractsVersion !== contractsVersion) {
+    throw new Error(
+      `Runtime contracts version ${runtimeContractsVersion} does not match installed contracts ${contractsVersion}.`
+    );
   }
 }
 

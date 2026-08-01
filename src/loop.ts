@@ -37,7 +37,11 @@ export function createSchedulerLoop(options: SchedulerLoopOptions): SchedulerLoo
     try {
       await options.service.runOnce();
     } catch (error: unknown) {
-      await options.onError?.(error);
+      try {
+        await options.onError?.(error);
+      } catch {
+        // Error reporting is observational and cannot terminate the scheduler loop.
+      }
     } finally {
       inFlight = undefined;
       schedule(options.cadenceMs);
@@ -54,7 +58,15 @@ export function createSchedulerLoop(options: SchedulerLoopOptions): SchedulerLoo
       }
 
       running = true;
-      schedule(options.initialDelayMs ?? 0);
+      void options.service.setSchedulingLoopActive?.(true);
+      const initialDelayMs = options.initialDelayMs ?? 0;
+
+      if (initialDelayMs === 0) {
+        inFlight = runOnce();
+        return;
+      }
+
+      schedule(initialDelayMs);
     },
     async stop(): Promise<void> {
       running = false;
@@ -65,6 +77,7 @@ export function createSchedulerLoop(options: SchedulerLoopOptions): SchedulerLoo
       }
 
       await inFlight;
+      await options.service.setSchedulingLoopActive?.(false);
     }
   };
 }

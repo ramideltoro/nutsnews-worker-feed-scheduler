@@ -28,8 +28,8 @@ The image runs as a non-root user, exposes port `8080`, and serves:
 
 The service consumes exact immutable worker-uplift package versions:
 
-- `@ramideltoro/nutsnews-worker-contracts@0.3.1`
-- `@ramideltoro/nutsnews-worker-runtime@0.4.0`
+- `@ramideltoro/nutsnews-worker-contracts@1.0.0`
+- `@ramideltoro/nutsnews-worker-runtime@1.0.0`
 
 Local and CI installs use the owner-scoped GitHub Packages npm registry. No package token value is committed.
 
@@ -40,6 +40,7 @@ The value-free configuration schema lives in `src/config.ts` and is exposed at `
 Important variables:
 
 - `NUTSNEWS_SCHEDULER_DEPENDENCY_MODE`: `test` or `production`
+- `NUTSNEWS_SCHEDULER_BUILD_REVISION`: bounded immutable commit or image revision exported in build telemetry
 - `NUTSNEWS_SCHEDULER_DATABASE_URL`
 - `NUTSNEWS_SCHEDULER_BACKEND_API_URL`
 - `NUTSNEWS_SCHEDULER_BACKEND_API_TOKEN`
@@ -58,7 +59,11 @@ Production mode uses only:
 - `worker_uplift_scheduler.feed_leases` through the scheduler stage PostgreSQL role; and
 - a publisher-only RabbitMQ adapter built on the shared runtime broker contract through the scheduler identity, with mandatory routing and publisher confirms.
 
-Startup and readiness fail closed unless all three external dependencies are available. Readiness names `backend-api-feed-source`, `postgres-schedule-lease-store`, and `rabbitmq`, and requires the system clock to be within five seconds of wall time. Responses contain status, adapter names, and bounded error classes only—never credentials, feed payloads, URLs, or response bodies.
+Startup and readiness fail closed unless all three external dependencies are available. Readiness names `backend-api-feed-source`, `postgres-schedule-lease-store`, and `rabbitmq`; the production dependency boundary also requires the shared system clock identity, while PostgreSQL server time is authoritative for durable lease ownership. Responses contain status, adapter names, and bounded error classes only—never credentials, feed payloads, URLs, or response bodies.
+
+Production dependency mode also requires `NUTSNEWS_SCHEDULER_BUILD_REVISION` to identify an immutable build. The `unknown` local-development sentinel is rejected before production-mode startup.
+
+The application binds its diagnostic HTTP server and signal handlers before broker initialization and before launching an immediate, non-overlapping scheduling loop, then schedules the next run only after the current run finishes. While broker startup is pending, liveness remains queryable and startup/readiness remain unhealthy. Production readiness requires a successful loop cycle within three cadences and the backend API, PostgreSQL lease store, and RabbitMQ publisher to identify themselves as the approved production adapters. Shadow mode exports `expected_active=0` for paging and ownership decisions, but it does not override dependency or loop readiness; a production-mode shadow is ready only while its real adapters and scheduling loop are usable. The container healthcheck uses `/live` so ownership changes do not restart a live diagnostic shell. Local test mode can still become ready with deterministic doubles. The application uses the system clock; the manual clock remains test-only.
 
 ## Scheduling Behavior
 
@@ -70,13 +75,20 @@ The scheduler evaluates active feed definitions with an injectable clock:
 - due feeds are ordered by priority, then feed ID;
 - each feed/window uses a stable idempotency key: `scheduler:feed:<feed-id>:<window>`;
 - the lease store is acquired before RabbitMQ publish;
+- production acquisition, renewal, expiry, release, and terminal mutations use PostgreSQL `statement_timestamp()` and reject ownership at the exact expiry boundary;
+- production lease duration is bounded from 60 through 300 seconds and each reclaim receives a fresh opaque token;
+- the server-clock renewal sample is converted to a conservative monotonic deadline before publication, with a terminal-mutation reserve kept before expiry;
 - the lease is finalized as `confirmed` only after publisher confirmation;
-- failed publishes mark the lease `failed`, allowing a later retry;
+- RabbitMQ connection, confirm-channel creation, publisher confirmation, and resource closure are bounded operations; pending connection setup is single-flight;
+- definitively rejected publishes mark the lease `failed`, and work known not to have been published may release its lease;
+- mandatory returns are definitive rejections, while confirm-callback errors, channel closure, and timeouts are ambiguous and quarantine the cached channel before reconnect;
+- ambiguous publish outcomes retain the active lease until expiry, and an uncertain post-publish database confirmation never downgrades a possibly confirmed row;
 - already confirmed windows are not published again.
+- telemetry delivery is fail-safe per configured sink: one rejecting log or metrics sink cannot starve another sink, fail scheduling, reopen a lease, or otherwise mutate scheduling state.
 
 The deployed loop runs once immediately after startup, then waits one configured cadence after each completed run. Runs never overlap. The backend shadow deployment currently bounds each run to one newly acquired feed window; the durable lease prevents repeated publication of the same feed/window across restarts or concurrent replicas.
 
-Published fetch requests validate against `@ramideltoro/nutsnews-worker-contracts@0.3.1`. Schedule-window metadata is carried inside the payload `limits` object while correlation and idempotency live on the worker envelope.
+Published fetch requests validate against `@ramideltoro/nutsnews-worker-contracts@1.0.0`. Schedule-window metadata is carried inside the payload `limits` object while correlation and idempotency live on the worker envelope.
 
 ## Concurrency and Recovery Proof
 
@@ -91,6 +103,10 @@ The scheduler proof suite covers:
 - multi-replica PostgreSQL and RabbitMQ integration.
 
 Failure telemetry identifies `feedId`, `windowStart`, `attemptCount` when available, `idempotencyKey` for lease failures, and the failing dependency (`lease-store` or `broker`) without recording secret values.
+
+`/metrics` also exports bounded build revision, service version, deployment mode, aggregate adapter mode, `expected_active`, explicit `nutsnews_worker_health_probe` liveness/startup/readiness state, bounded `nutsnews_worker_health_check` dependency state, distinct scheduler-loop active/fresh states, the last successful scheduling-cycle timestamp, and a fixed-bucket `nutsnews_worker_scheduler_cycle_duration_seconds` histogram. Runtime 1.0 owns build, deployment, ownership, last-success, health, and dependency-latency families; the scheduler adds only loop and cycle metrics. Probe series begin with truthful pre-start values and refresh after scheduling cycles as the service starts, becomes ready, becomes stale, and stops. Duration-less dependency events remain available to structured logs, and Runtime 1.0 records dependency histograms only when a measured duration exists. Shadow deployments export `expected_active=0`, allowing production ownership alerts to ignore them without changing readiness. When metrics are disabled, `/metrics` is intentionally empty.
+
+The container publishing workflow injects the immutable Git SHA into `NUTSNEWS_SCHEDULER_BUILD_REVISION` as well as the OCI revision label. A local test-mode image built without a revision remains explicitly `unknown`; production dependency mode rejects that sentinel.
 
 The PostgreSQL/RabbitMQ integration test skips unless both service URLs are present:
 

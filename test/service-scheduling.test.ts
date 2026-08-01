@@ -3,7 +3,8 @@ import {
   validateStagePayload
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
-  createBufferedRuntimeTelemetrySink
+  createBufferedRuntimeTelemetrySink,
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   describe,
@@ -17,8 +18,10 @@ import { SequenceSchedulerIdFactory } from "../src/ids.js";
 import { InMemoryScheduleLeaseStore } from "../src/lease-store.js";
 import type {
   ScheduleLeaseAcquireCommand,
+  ScheduleLeaseRecord,
   ScheduleLeaseStore
 } from "../src/lease-store.js";
+import { SchedulerPublishError } from "../src/publish-error.js";
 import { createSchedulerService } from "../src/service.js";
 import type { SchedulerFeedDefinition } from "../src/scheduling.js";
 import {
@@ -84,6 +87,75 @@ describe("scheduler publish flow", () => {
     await context.service.stop();
   });
 
+  it("does not let an occupied lease consume the scheduling concurrency allowance", async () => {
+    const context = createServiceContext([
+      dueFeed("feed-occupied", 10),
+      dueFeed("feed-next", 9)
+    ], new FirstFeedAlreadyConfirmedLeaseStore(), undefined, {
+      NUTSNEWS_SCHEDULER_CONCURRENCY: "1"
+    });
+
+    await context.service.start();
+    const result = await context.service.runOnce();
+
+    expect(result).toMatchObject({
+      dueFeedCount: 2,
+      scheduledCount: 1,
+      confirmedCount: 1,
+      failedCount: 0
+    });
+    expect(context.broker.published).toHaveLength(1);
+    expect(context.broker.published[0]?.payload).toMatchObject({
+      feedId: "feed-next"
+    });
+
+    await context.service.stop();
+  });
+
+  it("keeps a confirmed lease confirmed when confirmation telemetry rejects", async () => {
+    let rejectedConfirmationEvents = 0;
+    const telemetry: RuntimeTelemetrySink = {
+      emit: (event) => {
+        if (event.attributes?.event === "scheduler.feed.confirmed") {
+          rejectedConfirmationEvents += 1;
+          return Promise.reject(new Error("telemetry unavailable"));
+        }
+
+        return undefined;
+      }
+    };
+    const context = createServiceContext(undefined, new InMemoryScheduleLeaseStore(), telemetry);
+
+    await context.service.start();
+    const first = await context.service.runOnce();
+    const command = context.broker.published[0];
+
+    if (command === undefined) {
+      throw new Error("expected one published command");
+    }
+
+    expect(first).toMatchObject({
+      scheduledCount: 1,
+      confirmedCount: 1,
+      failedCount: 0
+    });
+    expect(rejectedConfirmationEvents).toBe(1);
+    expect(await context.dependencies.leaseStore.get(command.envelope.idempotencyKey)).toMatchObject({
+      status: "confirmed",
+      attemptCount: 1
+    });
+
+    const second = await context.service.runOnce();
+    expect(second).toMatchObject({
+      scheduledCount: 0,
+      confirmedCount: 0,
+      failedCount: 0
+    });
+    expect(context.broker.published).toHaveLength(1);
+
+    await context.service.stop();
+  });
+
   it("marks a failed publish retryable and confirms on a later retry", async () => {
     const context = createServiceContext();
 
@@ -116,7 +188,7 @@ describe("scheduler publish flow", () => {
     await context.service.stop();
   });
 
-  it("records confirm timeout as retryable broker failure telemetry", async () => {
+  it("retains an ambiguous confirm-timeout lease until expiry", async () => {
     const context = createServiceContext();
     const timeout = new Error("publisher confirm timed out");
 
@@ -132,6 +204,80 @@ describe("scheduler publish flow", () => {
       failedCount: 1
     });
     expect(context.telemetry.events.some((event) => event.attributes?.dependency === "broker" && event.attributes.error === "ConfirmTimeoutError")).toBe(true);
+    expect(context.telemetry.events).toContainEqual(expect.objectContaining({
+      name: "runtime.dependency.observed",
+      level: "error",
+      outcome: "failure",
+      attributes: expect.objectContaining({
+        event: "scheduler.run.completed",
+        failedCount: 1
+      }) as Record<string, unknown>
+    }));
+    expect(await context.dependencies.leaseStore.get(
+      "scheduler:feed:feed-world:20260723t000500000z"
+    )).toMatchObject({
+      status: "leased",
+      attemptCount: 1
+    });
+
+    context.broker.publishError = undefined;
+    await expect(context.service.runOnce()).resolves.toMatchObject({
+      scheduledCount: 0,
+      confirmedCount: 0,
+      failedCount: 0
+    });
+
+    await context.service.stop();
+  });
+
+  it("releases only a publish known not to have reached RabbitMQ", async () => {
+    const context = createServiceContext();
+
+    context.broker.publishError = new SchedulerPublishError(
+      "connection unavailable before publish",
+      "not-published"
+    );
+    await context.service.start();
+    await expect(context.service.runOnce()).resolves.toMatchObject({
+      scheduledCount: 1,
+      confirmedCount: 0,
+      failedCount: 1
+    });
+
+    expect(await context.dependencies.leaseStore.get(
+      "scheduler:feed:feed-world:20260723t000500000z"
+    )).toMatchObject({
+      status: "released",
+      attemptCount: 1
+    });
+
+    await context.service.stop();
+  });
+
+  it("never downgrades a confirmed lease after an ambiguous database response", async () => {
+    const delegate = new InMemoryScheduleLeaseStore();
+    const context = createServiceContext(undefined, new AmbiguousConfirmationLeaseStore(delegate));
+
+    await context.service.start();
+    const result = await context.service.runOnce();
+
+    expect(result).toMatchObject({
+      scheduledCount: 1,
+      confirmedCount: 0,
+      failedCount: 1
+    });
+    expect(context.broker.published).toHaveLength(1);
+    expect(await delegate.get("scheduler:feed:feed-world:20260723t000500000z")).toMatchObject({
+      status: "confirmed",
+      attemptCount: 1
+    });
+
+    await expect(context.service.runOnce()).resolves.toMatchObject({
+      scheduledCount: 0,
+      confirmedCount: 0,
+      failedCount: 0
+    });
+    expect(context.broker.published).toHaveLength(1);
 
     await context.service.stop();
   });
@@ -245,14 +391,16 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
       maxItems: 35
     }
   }
-], leaseStore: ScheduleLeaseStore = new InMemoryScheduleLeaseStore()) {
+], leaseStore?: ScheduleLeaseStore, telemetrySink?: RuntimeTelemetrySink, configOverrides: NodeJS.ProcessEnv = {}) {
   const config = loadSchedulerConfig({
     NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent",
     NUTSNEWS_SCHEDULER_LEASE_MS: "300000",
-    NUTSNEWS_SCHEDULER_CADENCE_MS: "60000"
+    NUTSNEWS_SCHEDULER_CADENCE_MS: "60000",
+    ...configOverrides
   });
   const clock = new ManualSchedulerClock("2026-07-23T00:05:42.000Z");
   const broker = new LocalBrokerTransport();
+  const resolvedLeaseStore = leaseStore ?? new InMemoryScheduleLeaseStore(() => clock.now());
   const dependencies: SchedulerDependencies = {
     mode: "test",
     clockKind: "manual-test",
@@ -261,7 +409,7 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
     feedSource: createLocalFeedSource({
       feeds
     }),
-    leaseStore,
+    leaseStore: resolvedLeaseStore,
     brokerTransport: broker,
     brokerProbe: broker
   };
@@ -269,7 +417,7 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
   const service = createSchedulerService({
     config,
     dependencies,
-    telemetry,
+    telemetry: telemetrySink ?? telemetry,
     idFactory: new SequenceSchedulerIdFactory(uuids)
   });
 
@@ -280,6 +428,82 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
     service,
     telemetry
   };
+}
+
+function dueFeed(feedId: string, priority: number): SchedulerFeedDefinition {
+  return {
+    feedId,
+    feedUrl: `https://feeds.example.test/${feedId}.xml`,
+    enabled: true,
+    cadenceMs: 60_000,
+    priority,
+    shardIndex: 0,
+    shardCount: 2
+  };
+}
+
+class FirstFeedAlreadyConfirmedLeaseStore extends InMemoryScheduleLeaseStore {
+  override acquire(command: ScheduleLeaseAcquireCommand) {
+    if (command.feedId !== "feed-occupied") {
+      return super.acquire(command);
+    }
+
+    return Promise.resolve({
+      status: "already_confirmed" as const,
+      record: {
+        token: "occupied-feed-token",
+        feedId: command.feedId,
+        idempotencyKey: command.idempotencyKey,
+        window: command.window,
+        status: "confirmed" as const,
+        acquiredAt: command.now.toISOString(),
+        leaseExpiresAt: new Date(command.now.getTime() + command.leaseMs).toISOString(),
+        attemptCount: 1,
+        confirmedAt: command.now.toISOString(),
+        publishReceiptMessageId: "already-published-message"
+      }
+    });
+  }
+}
+
+class AmbiguousConfirmationLeaseStore implements ScheduleLeaseStore {
+  readonly name = "ambiguous-confirmation-test-lease-store";
+  readonly adapterKind = "in-memory-test" as const;
+
+  constructor(private readonly delegate: ScheduleLeaseStore) {}
+
+  probe() {
+    return this.delegate.probe();
+  }
+
+  acquire(command: ScheduleLeaseAcquireCommand) {
+    return this.delegate.acquire(command);
+  }
+
+  renew(token: string, leaseMs: number) {
+    return this.delegate.renew(token, leaseMs);
+  }
+
+  release(token: string, releasedAt: Date) {
+    return this.delegate.release(token, releasedAt);
+  }
+
+  async markConfirmed(token: string, confirmedAt: Date, messageId: string): Promise<ScheduleLeaseRecord> {
+    await this.delegate.markConfirmed(token, confirmedAt, messageId);
+    throw new Error("database response lost after confirmation commit");
+  }
+
+  markFailed(token: string, failedAt: Date, reason: string) {
+    return this.delegate.markFailed(token, failedAt, reason);
+  }
+
+  get(idempotencyKey: string) {
+    return this.delegate.get(idempotencyKey);
+  }
+
+  close() {
+    return this.delegate.close();
+  }
 }
 
 class FailingLeaseStore implements ScheduleLeaseStore {
@@ -301,6 +525,14 @@ class FailingLeaseStore implements ScheduleLeaseStore {
   }
 
   markConfirmed(): Promise<never> {
+    return Promise.reject(new Error("not implemented"));
+  }
+
+  renew(): Promise<never> {
+    return Promise.reject(new Error("not implemented"));
+  }
+
+  release(): Promise<never> {
     return Promise.reject(new Error("not implemented"));
   }
 
