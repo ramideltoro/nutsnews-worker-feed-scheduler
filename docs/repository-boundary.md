@@ -46,7 +46,7 @@ This repository currently owns the deployable shell for the scheduler stage:
 - exact package pins to `@ramideltoro/nutsnews-worker-contracts@1.0.0` and `@ramideltoro/nutsnews-worker-runtime@1.0.0`;
 - liveness, startup, readiness, metrics, and value-free config-schema endpoints;
 - graceful shutdown using the shared runtime drain controller;
-- backend API feed source, durable scheduler-schema PostgreSQL leases, RabbitMQ publisher confirms, and a wall-clock freshness check in production mode;
+- backend API feed source, PostgreSQL-server-clock-authoritative scheduler leases, and bounded RabbitMQ publisher confirms in production mode;
 - local broker, manual clock, feed-source, and in-memory lease doubles for explicit test mode only;
 - shadow-mode enforcement so this service cannot cut over legacy ingestion by configuration alone.
 - due-feed scheduling decisions, idempotent schedule-window leases, contract-valid fetch-work publication, and publisher-confirm finalization.

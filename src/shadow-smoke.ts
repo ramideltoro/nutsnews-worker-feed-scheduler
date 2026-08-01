@@ -20,17 +20,18 @@ async function main(): Promise<void> {
   });
   const telemetry = createBufferedRuntimeTelemetrySink();
   const brokerTransport = new LocalBrokerTransport();
+  const clock = new ManualSchedulerClock(SCHEDULER_FIXTURE_NOW);
   const service = createSchedulerService({
     config,
     dependencies: {
       mode: "test",
       clockKind: "manual-test",
       brokerKind: "local-test",
-      clock: new ManualSchedulerClock(SCHEDULER_FIXTURE_NOW),
+      clock,
       feedSource: createLocalFeedSource({
         feeds: SCHEDULER_FIXTURE_FEEDS
       }),
-      leaseStore: new InMemoryScheduleLeaseStore(),
+      leaseStore: new InMemoryScheduleLeaseStore(() => clock.now()),
       brokerTransport,
       brokerProbe: brokerTransport
     },

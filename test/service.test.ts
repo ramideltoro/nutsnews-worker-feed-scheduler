@@ -17,7 +17,10 @@ import {
 import type { SchedulerDependencies } from "../src/dependencies.js";
 import type { ScheduleLeaseStore } from "../src/lease-store.js";
 import { createSchedulerLoop } from "../src/loop.js";
-import { createSchedulerService } from "../src/service.js";
+import {
+  SCHEDULER_HEALTH_CHECK_NAMES,
+  createSchedulerService
+} from "../src/service.js";
 import {
   LocalBrokerTransport,
   createLocalSchedulerDependencies
@@ -28,20 +31,22 @@ describe("createSchedulerService", () => {
     const config = loadSchedulerConfig({
       NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
     });
-    const metrics = createPrometheusRuntimeTelemetrySink({
-      identity: {
-        service: config.serviceName,
-        version: config.serviceVersion,
-        environment: config.environment,
-        host: config.host
-      }
-    });
+    const metrics = createIdentityMetrics(config, "shadow", "in_memory");
     const service = createSchedulerService({
       config,
       dependencies: createLocalSchedulerDependencies(),
       metrics
     });
+    await service.health.startup();
     const initial = `${metrics.collect()}${service.collectOperationalMetrics()}`;
+    const startupDurationBefore = metricValue(
+      metrics.collect(),
+      "nutsnews_worker_health_check_duration_seconds_count",
+      {
+        probe: "startup",
+        check: "service-started"
+      }
+    );
 
     expect(metricValue(initial, "nutsnews_worker_health_probe", {
       probe: "liveness",
@@ -56,13 +61,34 @@ describe("createSchedulerService", () => {
       outcome: "unhealthy"
     })).toBe(1);
     expect(initial.match(/^# TYPE nutsnews_worker_health_probe gauge$/gmu)).toHaveLength(1);
+    expect(initial.match(/^# TYPE nutsnews_worker_health_check gauge$/gmu)).toHaveLength(1);
+    expect(initial.match(/^# TYPE nutsnews_worker_health_check_duration_seconds histogram$/gmu)).toHaveLength(1);
     expect(initial).not.toMatch(/^# TYPE nutsnews_worker_health gauge$/mu);
+    expect(service.collectOperationalMetrics()).not.toContain("nutsnews_worker_health_");
+    expect(metricValue(initial, "nutsnews_worker_health_check", {
+      probe: "startup",
+      check: "service-started",
+      outcome: "unhealthy"
+    })).toBe(1);
 
     await service.start();
     expect(metricValue(metrics.collect(), "nutsnews_worker_health_probe", {
       probe: "startup",
       outcome: "ok"
     })).toBe(1);
+    expect(metricValue(metrics.collect(), "nutsnews_worker_health_check", {
+      probe: "startup",
+      check: "service-started",
+      outcome: "ok"
+    })).toBe(1);
+    expect(metricValue(
+      metrics.collect(),
+      "nutsnews_worker_health_check_duration_seconds_count",
+      {
+        probe: "startup",
+        check: "service-started"
+      }
+    )).toBe(startupDurationBefore + 1);
 
     await service.startScheduling();
     expect(metricValue(metrics.collect(), "nutsnews_worker_health_probe", {
@@ -80,6 +106,14 @@ describe("createSchedulerService", () => {
       probe: "readiness",
       outcome: "unhealthy"
     })).toBe(1);
+    expect(metricValue(stopped, "nutsnews_worker_health_check", {
+      probe: "startup",
+      check: "service-started",
+      outcome: "unhealthy"
+    })).toBe(1);
+    expect(stopped).not.toContain('check="other"');
+    expect(stopped).not.toContain('check="unknown"');
+    expect(stopped).not.toContain('probe="unspecified"');
   });
 
   it("starts, becomes ready, records a dry scheduler check, and drains cleanly", async () => {
@@ -131,6 +165,30 @@ describe("createSchedulerService", () => {
     expect(service.isStarted).toBe(false);
     expect(service.broker.state).toBe("closed");
     expect(telemetry.events.some((event) => event.name === "runtime.broker.state_changed")).toBe(true);
+  });
+
+  it("deduplicates one Runtime metrics sink passed through both telemetry inputs", async () => {
+    const config = loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
+    });
+    const metrics = createIdentityMetrics(config, "shadow", "in_memory");
+    const service = createSchedulerService({
+      config,
+      dependencies: createLocalSchedulerDependencies(),
+      telemetry: metrics,
+      metrics
+    });
+
+    await service.health.liveness();
+
+    expect(metricValue(
+      metrics.collect(),
+      "nutsnews_worker_health_check_duration_seconds_count",
+      {
+        probe: "liveness",
+        check: "process"
+      }
+    )).toBe(1);
   });
 
   it("reports readiness unhealthy when the local feed source is unhealthy", async () => {
@@ -274,7 +332,7 @@ describe("createSchedulerService", () => {
       status: "ok"
     });
 
-    service.setSchedulingLoopActive?.(true);
+    await service.setSchedulingLoopActive?.(true);
     const neverSucceededReadiness = await service.health.readiness();
 
     expect(neverSucceededReadiness.status).toBe("unhealthy");
@@ -283,7 +341,12 @@ describe("createSchedulerService", () => {
         reason: "production-scheduling-loop-never-succeeded"
       }
     });
-    service.setSchedulingLoopActive?.(false);
+    await service.setSchedulingLoopActive?.(false);
+    expect(metricValue(metrics.collect(), "nutsnews_worker_health_check", {
+      probe: "readiness",
+      check: "scheduler-loop",
+      outcome: "unhealthy"
+    })).toBe(1);
 
     await service.startScheduling();
     const readiness = await service.health.readiness();
@@ -294,7 +357,6 @@ describe("createSchedulerService", () => {
       "rabbitmq-publisher",
       "feed-source",
       "schedule-lease-store",
-      "runtime-clock",
       "scheduler-loop",
       "production-adapters"
     ]);
@@ -355,6 +417,31 @@ describe("createSchedulerService", () => {
     expect(metrics.collect()).toContain('deployment="production",adapter="production"');
     expect(metricValue(metrics.collect(), "nutsnews_worker_expected_active")).toBe(1);
 
+    await service.stop();
+  });
+
+  it("renews an unexpired production lease before publishing", async () => {
+    const config = loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "production",
+      NUTSNEWS_SCHEDULER_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
+      NUTSNEWS_SCHEDULER_DATABASE_URL: "postgres://configured",
+      NUTSNEWS_SCHEDULER_BACKEND_API_URL: "https://backend.example.test",
+      NUTSNEWS_SCHEDULER_BACKEND_API_TOKEN: "configured",
+      NUTSNEWS_SCHEDULER_RABBITMQ_URL: "amqps://configured",
+      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
+    });
+    const dependencies = productionCompatibleTestDependencies(1);
+    const renew = vi.spyOn(dependencies.leaseStore, "renew");
+    const service = createSchedulerService({
+      config,
+      dependencies
+    });
+
+    await service.start();
+    await expect(service.startScheduling()).resolves.toBeUndefined();
+
+    expect(renew).toHaveBeenCalledOnce();
+    expect(renew).toHaveBeenCalledWith(expect.any(String), 300_000);
     await service.stop();
   });
 
@@ -450,8 +537,10 @@ describe("createSchedulerService", () => {
   });
 });
 
-function productionCompatibleTestDependencies(): SchedulerDependencies {
-  const local = createLocalSchedulerDependencies();
+function productionCompatibleTestDependencies(dueFeedCount = 0): SchedulerDependencies {
+  const local = createLocalSchedulerDependencies({
+    dueFeedCount
+  });
   const leaseStore = productionIdentityLeaseStore(local.leaseStore);
   const broker = new ProductionIdentityLocalBroker();
 
@@ -477,6 +566,8 @@ function productionIdentityLeaseStore(delegate: ScheduleLeaseStore): ScheduleLea
     adapterKind: "postgres",
     probe: () => delegate.probe(),
     acquire: (command) => delegate.acquire(command),
+    renew: (token, leaseMs) => delegate.renew(token, leaseMs),
+    release: (token, releasedAt) => delegate.release(token, releasedAt),
     markConfirmed: (token, confirmedAt, messageId) => delegate.markConfirmed(token, confirmedAt, messageId),
     markFailed: (token, failedAt, reason) => delegate.markFailed(token, failedAt, reason),
     get: (idempotencyKey) => delegate.get(idempotencyKey),
@@ -502,6 +593,15 @@ function createIdentityMetrics(
       revision: config.buildRevision,
       deployment,
       adapter
+    },
+    cardinality: {
+      dependencies: [
+        "scheduler-shell",
+        "scheduler",
+        "lease-store",
+        "broker"
+      ],
+      healthChecks: Object.values(SCHEDULER_HEALTH_CHECK_NAMES).flat()
     }
   });
 }

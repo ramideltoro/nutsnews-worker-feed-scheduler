@@ -1,7 +1,10 @@
 import os from "node:os";
 
+import { SCHEDULE_LEASE_MAX_MS } from "./lease-store.js";
+
 export const SCHEDULER_SERVICE_NAME = "nutsnews-worker-feed-scheduler" as const;
 export const SCHEDULER_SERVICE_VERSION = "0.1.0" as const;
+export const SCHEDULER_PRODUCTION_MIN_LEASE_MS = 60_000;
 
 export type SchedulerDependencyMode = "test" | "production";
 export type SchedulerTelemetryLogMode = "stdout" | "silent";
@@ -99,7 +102,14 @@ export function loadSchedulerConfig(env: NodeJS.ProcessEnv = process.env): Sched
     dependencyMode,
     dependencies,
     cadenceMs: parseInteger(env.NUTSNEWS_SCHEDULER_CADENCE_MS, "NUTSNEWS_SCHEDULER_CADENCE_MS", 60_000, 1_000, 86_400_000, issues),
-    leaseMs: parseInteger(env.NUTSNEWS_SCHEDULER_LEASE_MS, "NUTSNEWS_SCHEDULER_LEASE_MS", 300_000, 1_000, 86_400_000, issues),
+    leaseMs: parseInteger(
+      env.NUTSNEWS_SCHEDULER_LEASE_MS,
+      "NUTSNEWS_SCHEDULER_LEASE_MS",
+      SCHEDULE_LEASE_MAX_MS,
+      1_000,
+      SCHEDULE_LEASE_MAX_MS,
+      issues
+    ),
     concurrency: parseInteger(env.NUTSNEWS_SCHEDULER_CONCURRENCY, "NUTSNEWS_SCHEDULER_CONCURRENCY", 4, 1, 128, issues),
     shutdownTimeoutMs: parseInteger(env.NUTSNEWS_SCHEDULER_SHUTDOWN_TIMEOUT_MS, "NUTSNEWS_SCHEDULER_SHUTDOWN_TIMEOUT_MS", 30_000, 1_000, 600_000, issues),
     shadowMode: parseBoolean(env.NUTSNEWS_SCHEDULER_SHADOW_MODE, "NUTSNEWS_SCHEDULER_SHADOW_MODE", true, issues),
@@ -111,8 +121,12 @@ export function loadSchedulerConfig(env: NodeJS.ProcessEnv = process.env): Sched
     issues.push("NUTSNEWS_SCHEDULER_BUILD_REVISION must identify an immutable build when NUTSNEWS_SCHEDULER_DEPENDENCY_MODE=production.");
   }
 
-  if (config.leaseMs <= config.cadenceMs) {
-    issues.push("NUTSNEWS_SCHEDULER_LEASE_MS must be greater than NUTSNEWS_SCHEDULER_CADENCE_MS.");
+  if (config.leaseMs < config.cadenceMs) {
+    issues.push("NUTSNEWS_SCHEDULER_LEASE_MS must be greater than or equal to NUTSNEWS_SCHEDULER_CADENCE_MS.");
+  }
+
+  if (config.dependencyMode === "production" && config.leaseMs < SCHEDULER_PRODUCTION_MIN_LEASE_MS) {
+    issues.push(`NUTSNEWS_SCHEDULER_LEASE_MS must be at least ${String(SCHEDULER_PRODUCTION_MIN_LEASE_MS)} in production so bounded publication and terminal fencing finish before expiry.`);
   }
 
   if (!config.shadowMode) {

@@ -26,6 +26,11 @@ import type {
   ScheduleLeaseStatus,
   ScheduleLeaseStore
 } from "./lease-store.js";
+import {
+  SCHEDULE_LEASE_MAX_MS,
+  ScheduleLeaseOwnershipError,
+  assertScheduleLeaseDuration
+} from "./lease-store.js";
 import type { SchedulerFeedDefinition } from "./scheduling.js";
 import { createLocalSchedulerDependencies } from "./test-doubles.js";
 import { SchedulerRabbitMqPublisherTransport } from "./rabbitmq-publisher.js";
@@ -222,6 +227,8 @@ export class PostgresScheduleLeaseStore implements ScheduleLeaseStore {
       connectionString,
       max: 4,
       connectionTimeoutMillis: DEPENDENCY_TIMEOUT_MS,
+      query_timeout: DEPENDENCY_TIMEOUT_MS,
+      statement_timeout: DEPENDENCY_TIMEOUT_MS,
       idleTimeoutMillis: 30_000,
       application_name: "nutsnews-worker-feed-scheduler"
     });
@@ -243,6 +250,7 @@ export class PostgresScheduleLeaseStore implements ScheduleLeaseStore {
   }
 
   async acquire(command: ScheduleLeaseAcquireCommand): Promise<ScheduleLeaseAcquireResult> {
+    assertScheduleLeaseDuration(command.leaseMs);
     const client = await this.pool.connect();
 
     try {
@@ -250,8 +258,26 @@ export class PostgresScheduleLeaseStore implements ScheduleLeaseStore {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         command.feedId
       ]);
-      await releaseExpiredFeedLease(client, command.feedId, command.now);
-      const existing = await latestLeaseForIdempotencyKey(client, command.idempotencyKey);
+      await releaseExpiredFeedLease(client, command.feedId);
+      const active = await activeLeaseForFeed(client, command.feedId);
+
+      if (active !== undefined) {
+        if (active.lease_unexpired === true) {
+          await client.query("COMMIT");
+          return {
+            status: "lease_active",
+            record: rowToRecord(active)
+          };
+        }
+
+        await releaseExpiredFeedLease(client, command.feedId);
+      }
+
+      const existing = await latestLeaseForIdempotencyKey(
+        client,
+        command.feedId,
+        command.idempotencyKey
+      );
 
       if (existing !== undefined) {
         const record = rowToRecord(existing);
@@ -264,19 +290,10 @@ export class PostgresScheduleLeaseStore implements ScheduleLeaseStore {
           };
         }
 
-        if (record.status === "leased" && Date.parse(record.leaseExpiresAt) > command.now.getTime()) {
-          await client.query("COMMIT");
-          return {
-            status: "lease_active",
-            record
-          };
-        }
       }
 
       const leaseVersion = await nextFeedLeaseVersion(client, command.feedId);
       const token = randomUUID();
-      const acquiredAt = command.now.toISOString();
-      const leaseExpiresAt = new Date(command.now.getTime() + command.leaseMs).toISOString();
       const inserted = await client.query<DbFeedLeaseRow>(
         `INSERT INTO ${POSTGRES_LEASE_TABLE} (
           feed_url,
@@ -286,15 +303,20 @@ export class PostgresScheduleLeaseStore implements ScheduleLeaseStore {
           acquired_at,
           expires_at,
           diagnostic_metadata
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
-        RETURNING *`,
+        ) VALUES (
+          $1,$2,$3,$4,
+          statement_timestamp(),
+          statement_timestamp() + (LEAST($5::integer, $6::integer) * INTERVAL '1 millisecond'),
+          $7::jsonb
+        )
+        RETURNING *, statement_timestamp() AS ownership_checked_at`,
         [
           command.feedId,
           token,
           command.idempotencyKey,
           leaseVersion,
-          acquiredAt,
-          leaseExpiresAt,
+          command.leaseMs,
+          SCHEDULE_LEASE_MAX_MS,
           JSON.stringify({
             status: "leased",
             windowStart: command.window.start,
@@ -318,54 +340,100 @@ export class PostgresScheduleLeaseStore implements ScheduleLeaseStore {
     }
   }
 
+  async renew(token: string, leaseMs: number): Promise<ScheduleLeaseRecord> {
+    assertScheduleLeaseDuration(leaseMs);
+    const result = await this.pool.query<DbFeedLeaseRow>(
+      `WITH lease_clock AS (
+         SELECT statement_timestamp() AS checked_at
+       )
+       UPDATE ${POSTGRES_LEASE_TABLE} AS lease
+       SET expires_at = lease_clock.checked_at
+         + (LEAST($2::integer, $3::integer) * INTERVAL '1 millisecond')
+       FROM lease_clock
+       WHERE lease.lease_token = $1
+         AND lease.released_at IS NULL
+         AND lease.diagnostic_metadata->>'status' = 'leased'
+         AND lease.expires_at > lease_clock.checked_at
+       RETURNING lease.*, lease_clock.checked_at AS ownership_checked_at`,
+      [
+        token,
+        leaseMs,
+        SCHEDULE_LEASE_MAX_MS
+      ]
+    );
+
+    return rowToRecord(oneOwnedLeaseRow(result, "renew"));
+  }
+
+  async release(token: string, _releasedAt: Date): Promise<ScheduleLeaseRecord> {
+    void _releasedAt;
+    const result = await this.pool.query<DbFeedLeaseRow>(
+      `UPDATE ${POSTGRES_LEASE_TABLE}
+       SET released_at = statement_timestamp(),
+           diagnostic_metadata = diagnostic_metadata || '{"status":"released"}'::jsonb
+       WHERE lease_token = $1
+         AND released_at IS NULL
+         AND diagnostic_metadata->>'status' = 'leased'
+         AND expires_at > statement_timestamp()
+       RETURNING *`,
+      [
+        token
+      ]
+    );
+
+    return rowToRecord(oneOwnedLeaseRow(result, "release"));
+  }
+
   async markConfirmed(
     token: string,
-    confirmedAt: Date,
+    _confirmedAt: Date,
     publishReceiptMessageId: string
   ): Promise<ScheduleLeaseRecord> {
     const result = await this.pool.query<DbFeedLeaseRow>(
       `UPDATE ${POSTGRES_LEASE_TABLE}
-       SET released_at = $2,
-           diagnostic_metadata = diagnostic_metadata || $3::jsonb
-       WHERE lease_token = $1 AND released_at IS NULL
+       SET released_at = statement_timestamp(),
+           diagnostic_metadata = diagnostic_metadata || $2::jsonb
+       WHERE lease_token = $1
+         AND released_at IS NULL
+         AND diagnostic_metadata->>'status' = 'leased'
+         AND expires_at > statement_timestamp()
        RETURNING *`,
       [
         token,
-        confirmedAt.toISOString(),
         JSON.stringify({
           status: "confirmed",
-          confirmedAt: confirmedAt.toISOString(),
           publishReceiptMessageId
         })
       ]
     );
 
-    return rowToRecord(oneRow(result));
+    return rowToRecord(oneOwnedLeaseRow(result, "confirm"));
   }
 
   async markFailed(
     token: string,
-    failedAt: Date,
+    _failedAt: Date,
     failureReason: string
   ): Promise<ScheduleLeaseRecord> {
     const result = await this.pool.query<DbFeedLeaseRow>(
       `UPDATE ${POSTGRES_LEASE_TABLE}
-       SET released_at = $2,
-           diagnostic_metadata = diagnostic_metadata || $3::jsonb
-       WHERE lease_token = $1 AND released_at IS NULL
+       SET released_at = statement_timestamp(),
+           diagnostic_metadata = diagnostic_metadata || $2::jsonb
+       WHERE lease_token = $1
+         AND released_at IS NULL
+         AND diagnostic_metadata->>'status' = 'leased'
+         AND expires_at > statement_timestamp()
        RETURNING *`,
       [
         token,
-        failedAt.toISOString(),
         JSON.stringify({
           status: "failed",
-          failedAt: failedAt.toISOString(),
           failureReason: failureReason.slice(0, 128)
         })
       ]
     );
 
-    return rowToRecord(oneRow(result));
+    return rowToRecord(oneOwnedLeaseRow(result, "fail"));
   }
 
   async get(idempotencyKey: string): Promise<ScheduleLeaseRecord | undefined> {
@@ -410,6 +478,8 @@ interface DbFeedLeaseRow {
   readonly expires_at: Date;
   readonly released_at: Date | null;
   readonly diagnostic_metadata: Readonly<Record<string, unknown>>;
+  readonly lease_unexpired?: boolean;
+  readonly ownership_checked_at?: Date;
 }
 
 function requiredEnvironmentValue(value: string | undefined, name: string): string {
@@ -476,36 +546,61 @@ function mapBackendFeed(
 
 async function releaseExpiredFeedLease(
   client: PoolClient,
-  feedId: string,
-  now: Date
+  feedId: string
 ): Promise<void> {
   await client.query(
     `UPDATE ${POSTGRES_LEASE_TABLE}
-     SET released_at = $2,
+     SET released_at = statement_timestamp(),
          diagnostic_metadata = diagnostic_metadata || '{"status":"expired"}'::jsonb
-     WHERE feed_url = $1 AND released_at IS NULL AND expires_at <= $2`,
+     WHERE feed_url = $1
+       AND released_at IS NULL
+       AND expires_at <= statement_timestamp()`,
     [
-      feedId,
-      now.toISOString()
+      feedId
     ]
   );
 }
 
 async function latestLeaseForIdempotencyKey(
   client: PoolClient,
+  feedId: string,
   idempotencyKey: string
 ): Promise<DbFeedLeaseRow | undefined> {
   const result = await client.query<DbFeedLeaseRow>(
-    `SELECT *
+    `SELECT *,
+       released_at IS NULL AND expires_at > statement_timestamp() AS lease_unexpired
      FROM ${POSTGRES_LEASE_TABLE}
-     WHERE holder_stage_execution_id = $1
+     WHERE feed_url = $1
+       AND holder_stage_execution_id = $2
      ORDER BY lease_version DESC
      LIMIT 1
      FOR UPDATE`,
     [
+      feedId,
       idempotencyKey
     ]
   );
+  return result.rows[0];
+}
+
+async function activeLeaseForFeed(
+  client: PoolClient,
+  feedId: string
+): Promise<DbFeedLeaseRow | undefined> {
+  const result = await client.query<DbFeedLeaseRow>(
+    `SELECT *,
+       expires_at > statement_timestamp() AS lease_unexpired
+     FROM ${POSTGRES_LEASE_TABLE}
+     WHERE feed_url = $1
+       AND released_at IS NULL
+     ORDER BY lease_version DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [
+      feedId
+    ]
+  );
+
   return result.rows[0];
 }
 
@@ -537,6 +632,7 @@ function rowToRecord(row: DbFeedLeaseRow): ScheduleLeaseRecord {
     ?? "unknown";
   const confirmedAt = stringMetadata(metadata.confirmedAt);
   const failedAt = stringMetadata(metadata.failedAt);
+  const releasedAt = stringMetadata(metadata.releasedAt);
   const failureReason = stringMetadata(metadata.failureReason);
   const publishReceiptMessageId = stringMetadata(metadata.publishReceiptMessageId);
 
@@ -552,12 +648,18 @@ function rowToRecord(row: DbFeedLeaseRow): ScheduleLeaseRecord {
     status,
     acquiredAt: row.acquired_at.toISOString(),
     leaseExpiresAt: row.expires_at.toISOString(),
-    attemptCount: integerMetadata(metadata.attemptCount, Number(row.lease_version)),
-    ...(confirmedAt === undefined ? {} : {
-      confirmedAt
+    ...(row.ownership_checked_at === undefined ? {} : {
+      ownershipCheckedAt: row.ownership_checked_at.toISOString()
     }),
-    ...(failedAt === undefined ? {} : {
-      failedAt
+    attemptCount: integerMetadata(metadata.attemptCount, Number(row.lease_version)),
+    ...(status !== "confirmed" ? {} : {
+      confirmedAt: confirmedAt ?? row.released_at?.toISOString() ?? row.acquired_at.toISOString()
+    }),
+    ...(status !== "failed" ? {} : {
+      failedAt: failedAt ?? row.released_at?.toISOString() ?? row.acquired_at.toISOString()
+    }),
+    ...(status !== "released" && status !== "expired" ? {} : {
+      releasedAt: releasedAt ?? row.released_at?.toISOString() ?? row.expires_at.toISOString()
     }),
     ...(failureReason === undefined ? {} : {
       failureReason
@@ -569,7 +671,12 @@ function rowToRecord(row: DbFeedLeaseRow): ScheduleLeaseRecord {
 }
 
 function scheduleLeaseStatus(value: unknown): ScheduleLeaseStatus {
-  return value === "confirmed" || value === "failed" ? value : "leased";
+  return value === "confirmed"
+    || value === "failed"
+    || value === "released"
+    || value === "expired"
+    ? value
+    : "leased";
 }
 
 function stringMetadata(value: unknown): string | undefined {
@@ -585,6 +692,21 @@ function oneRow<Row extends QueryResultRow>(result: QueryResult<Row>): Row {
 
   if (row === undefined) {
     throw new SchedulerDependencyError("PostgreSQL schedule lease operation returned no row.");
+  }
+
+  return row;
+}
+
+function oneOwnedLeaseRow(
+  result: QueryResult<DbFeedLeaseRow>,
+  operation: string
+): DbFeedLeaseRow {
+  const row = result.rows[0];
+
+  if (row === undefined) {
+    throw new ScheduleLeaseOwnershipError(
+      `Schedule lease ${operation} rejected because ownership is absent, terminal, or expired.`
+    );
   }
 
   return row;

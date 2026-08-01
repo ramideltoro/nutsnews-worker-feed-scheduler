@@ -33,6 +33,7 @@ import type {
   ScheduleLeaseRecord,
   ScheduleLeaseStore
 } from "../src/lease-store.js";
+import { ScheduleLeaseOwnershipError } from "../src/lease-store.js";
 import { PostgresScheduleLeaseStore } from "../src/production-dependencies.js";
 import { SchedulerRabbitMqPublisherTransport } from "../src/rabbitmq-publisher.js";
 import { createSchedulerService } from "../src/service.js";
@@ -131,6 +132,169 @@ describeWithServices("PostgreSQL and RabbitMQ scheduler integration", () => {
       first.service.stop(),
       second.service.stop()
     ]);
+  });
+
+  it("uses PostgreSQL time, fresh tokens, and exact-boundary ownership fencing", async () => {
+    const store = new PostgresScheduleLeaseStore(postgresUrl ?? "");
+    const command: ScheduleLeaseAcquireCommand = {
+      feedId: "feed-server-clock",
+      idempotencyKey: "scheduler:feed:feed-server-clock:20260723t000500000z",
+      window: {
+        start: "2026-07-23T00:05:00.000Z",
+        end: "2026-07-23T00:10:00.000Z",
+        key: "20260723t000500000z"
+      },
+      now: new Date("2000-01-01T00:00:00.000Z"),
+      leaseMs: 300_000
+    };
+
+    try {
+      const first = await store.acquire(command);
+      const serverNow = await pool.query<{ readonly now: Date }>(
+        "SELECT statement_timestamp() AS now"
+      );
+      expect(first.status).toBe("acquired");
+      expect(Math.abs(
+        new Date(first.record.acquiredAt).getTime()
+        - (serverNow.rows[0]?.now.getTime() ?? 0)
+      )).toBeLessThan(10_000);
+      expect(
+        new Date(first.record.leaseExpiresAt).getTime()
+        - new Date(first.record.acquiredAt).getTime()
+      ).toBe(300_000);
+
+      await pool.query(
+        `UPDATE worker_uplift_scheduler.feed_leases
+         SET expires_at = statement_timestamp()
+         WHERE lease_token = $1`,
+        [
+          first.record.token
+        ]
+      );
+      await expect(store.markConfirmed(
+        first.record.token,
+        new Date("2099-01-01T00:00:00.000Z"),
+        "receipt-expired"
+      )).rejects.toBeInstanceOf(ScheduleLeaseOwnershipError);
+
+      for (const operation of ["renew", "release", "fail"] as const) {
+        const boundary = await store.acquire({
+          ...command,
+          feedId: `${command.feedId}-${operation}`,
+          idempotencyKey: `${command.idempotencyKey}-${operation}`
+        });
+        await pool.query(
+          `UPDATE worker_uplift_scheduler.feed_leases
+           SET expires_at = statement_timestamp()
+           WHERE lease_token = $1`,
+          [
+            boundary.record.token
+          ]
+        );
+        const mutation = operation === "renew"
+          ? store.renew(boundary.record.token, 300_000)
+          : operation === "release"
+            ? store.release(boundary.record.token, new Date("2099-01-01T00:00:00.000Z"))
+            : store.markFailed(
+                boundary.record.token,
+                new Date("2099-01-01T00:00:00.000Z"),
+                "expired"
+              );
+
+        await expect(mutation).rejects.toBeInstanceOf(ScheduleLeaseOwnershipError);
+      }
+
+      const reclaimed = await store.acquire(command);
+      expect(reclaimed.status).toBe("acquired");
+      expect(reclaimed.record.token).not.toBe(first.record.token);
+      expect(reclaimed.record.attemptCount).toBe(2);
+      await expect(store.release(
+        first.record.token,
+        new Date("2099-01-01T00:00:00.000Z")
+      )).rejects.toBeInstanceOf(ScheduleLeaseOwnershipError);
+
+      const renewed = await store.renew(reclaimed.record.token, 300_000);
+      const renewedNow = await pool.query<{ readonly now: Date }>(
+        "SELECT statement_timestamp() AS now"
+      );
+      const renewedRemainingMs = new Date(renewed.leaseExpiresAt).getTime()
+        - (renewedNow.rows[0]?.now.getTime() ?? 0);
+      expect(renewedRemainingMs).toBeGreaterThan(299_000);
+      expect(renewedRemainingMs).toBeLessThanOrEqual(300_000);
+
+      const confirmed = await store.markConfirmed(
+        reclaimed.record.token,
+        new Date("2099-01-01T00:00:00.000Z"),
+        "receipt-confirmed"
+      );
+      expect(confirmed.status).toBe("confirmed");
+      expect(new Date(confirmed.confirmedAt ?? "").getUTCFullYear()).not.toBe(2099);
+      await expect(store.release(
+        reclaimed.record.token,
+        new Date("2099-01-01T00:00:00.000Z")
+      )).rejects.toBeInstanceOf(ScheduleLeaseOwnershipError);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("serializes adjacent windows per feed without coupling idempotency across feeds", async () => {
+    const store = new PostgresScheduleLeaseStore(postgresUrl ?? "");
+    const firstWindow: ScheduleLeaseAcquireCommand = {
+      feedId: "feed-adjacent-window",
+      idempotencyKey: "shared-regression-key",
+      window: {
+        start: "2026-07-23T00:05:00.000Z",
+        end: "2026-07-23T00:10:00.000Z",
+        key: "20260723t000500000z"
+      },
+      now: new Date("2000-01-01T00:00:00.000Z"),
+      leaseMs: 300_000
+    };
+
+    try {
+      const first = await store.acquire(firstWindow);
+      const adjacent = await store.acquire({
+        ...firstWindow,
+        idempotencyKey: "scheduler:feed:feed-adjacent-window:20260723t001000000z",
+        window: {
+          start: "2026-07-23T00:10:00.000Z",
+          end: "2026-07-23T00:15:00.000Z",
+          key: "20260723t001000000z"
+        }
+      });
+
+      expect(first.status).toBe("acquired");
+      expect(adjacent).toMatchObject({
+        status: "lease_active",
+        record: {
+          token: first.record.token,
+          idempotencyKey: firstWindow.idempotencyKey
+        }
+      });
+
+      await store.markConfirmed(
+        first.record.token,
+        new Date("2099-01-01T00:00:00.000Z"),
+        "receipt-first-feed"
+      );
+      const secondFeed = await store.acquire({
+        ...firstWindow,
+        feedId: "feed-cross-key-isolation"
+      });
+
+      expect(secondFeed).toMatchObject({
+        status: "acquired",
+        record: {
+          feedId: "feed-cross-key-isolation",
+          idempotencyKey: firstWindow.idempotencyKey,
+          attemptCount: 1
+        }
+      });
+      expect(secondFeed.record.token).not.toBe(first.record.token);
+    } finally {
+      await store.close();
+    }
   });
 
   function createReplica(
@@ -299,6 +463,18 @@ export class PostgresTestLeaseStore implements ScheduleLeaseStore {
     );
 
     return rowToRecord(oneRow(result));
+  }
+
+  renew(_token: string, _leaseMs: number): Promise<ScheduleLeaseRecord> {
+    void _token;
+    void _leaseMs;
+    return Promise.reject(new Error("PostgresTestLeaseStore renewal is not used by this integration path."));
+  }
+
+  release(_token: string, _releasedAt: Date): Promise<ScheduleLeaseRecord> {
+    void _token;
+    void _releasedAt;
+    return Promise.reject(new Error("PostgresTestLeaseStore release is not used by this integration path."));
   }
 
   async markFailed(token: string, failedAt: Date, failureReason: string): Promise<ScheduleLeaseRecord> {

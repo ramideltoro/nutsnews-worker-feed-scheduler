@@ -9,7 +9,9 @@ import type {
   WorkerRoute,
   WorkerStage
 } from "@ramideltoro/nutsnews-worker-contracts";
+import { getWorkerRoute } from "@ramideltoro/nutsnews-worker-contracts";
 import {
+  afterEach,
   describe,
   expect,
   it,
@@ -41,6 +43,7 @@ import {
   createLocalFeedSource,
   createLocalSchedulerDependencies
 } from "../src/test-doubles.js";
+import type { SchedulerFeedDefinition } from "../src/scheduling.js";
 
 const productionEnvironment = {
   NUTSNEWS_SCHEDULER_DATABASE_URL: "postgres://scheduler.example.test/shadow",
@@ -48,6 +51,10 @@ const productionEnvironment = {
   NUTSNEWS_SCHEDULER_BACKEND_API_TOKEN: "configured-test-token",
   NUTSNEWS_SCHEDULER_RABBITMQ_URL: "amqps://scheduler.example.test/worker-uplift"
 } as const;
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("production scheduler dependencies", () => {
   it("selects only system/backend/PostgreSQL/RabbitMQ adapters in production mode", async () => {
@@ -111,13 +118,11 @@ describe("production scheduler dependencies", () => {
     expect(readinessJson).toContain("backend-api-feed-source");
     expect(readinessJson).toContain("postgres-schedule-lease-store");
     expect(readinessJson).toContain("rabbitmq-payload-publisher");
-    expect(readinessJson).toContain("system-runtime-clock");
     expect(readiness.checks.map((check) => check.name)).toEqual([
       "broker-lifecycle",
       "rabbitmq-publisher",
       "feed-source",
       "schedule-lease-store",
-      "runtime-clock",
       "scheduler-loop",
       "production-adapters"
     ]);
@@ -138,6 +143,64 @@ describe("production scheduler dependencies", () => {
 
     await expect(service.start()).rejects.toThrow(/failed the startup probe/u);
     expect(broker.connectCount).toBe(0);
+  });
+
+  it("leaves the lease fenced when publication crosses its production deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T00:05:42.000Z"));
+    const leaseStore = new DeadlineProductionLeaseStore();
+    const broker = new DeadlineProductionBrokerTransport();
+    const dependencies = deadlineProductionDependencies(leaseStore, broker);
+    const service = createSchedulerService({
+      config: productionConfig({
+        NUTSNEWS_SCHEDULER_CADENCE_MS: "60000",
+        NUTSNEWS_SCHEDULER_LEASE_MS: "60000"
+      }),
+      dependencies
+    });
+
+    await service.start();
+    await service.setSchedulingLoopActive?.(true);
+    const run = service.runOnce();
+    await broker.publishStarted.promise;
+    await vi.advanceTimersByTimeAsync(50_000);
+
+    await expect(run).resolves.toMatchObject({
+      scheduledCount: 1,
+      confirmedCount: 0,
+      failedCount: 1
+    });
+    await expect(leaseStore.get(
+      "scheduler:feed:feed-production:20260723t000500000z"
+    )).resolves.toMatchObject({
+      status: "leased"
+    });
+
+    await broker.finishPublish();
+    await service.stop();
+  });
+
+  it("refuses publication when renewal lacks the configured server-clock duration", async () => {
+    const leaseStore = new ShortRenewalProductionLeaseStore();
+    const broker = new DeadlineProductionBrokerTransport();
+    const service = createSchedulerService({
+      config: productionConfig({
+        NUTSNEWS_SCHEDULER_CADENCE_MS: "60000",
+        NUTSNEWS_SCHEDULER_LEASE_MS: "60000"
+      }),
+      dependencies: deadlineProductionDependencies(leaseStore, broker)
+    });
+
+    await service.start();
+    await service.setSchedulingLoopActive?.(true);
+    await expect(service.runOnce()).resolves.toMatchObject({
+      scheduledCount: 1,
+      confirmedCount: 0,
+      failedCount: 1
+    });
+    expect(broker.publishCount).toBe(0);
+
+    await service.stop();
   });
 });
 
@@ -211,18 +274,45 @@ describe("backend API feed source", () => {
   });
 });
 
-function productionConfig() {
+function productionConfig(overrides: NodeJS.ProcessEnv = {}) {
   return loadSchedulerConfig({
     NUTSNEWS_ENVIRONMENT: "production",
     NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "production",
     NUTSNEWS_SCHEDULER_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
     ...productionEnvironment,
     NUTSNEWS_SCHEDULER_CADENCE_MS: "300000",
-    NUTSNEWS_SCHEDULER_LEASE_MS: "900000",
+    NUTSNEWS_SCHEDULER_LEASE_MS: "300000",
     NUTSNEWS_SCHEDULER_CONCURRENCY: "1",
     NUTSNEWS_SCHEDULER_SHADOW_MODE: "true",
-    NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
+    NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent",
+    ...overrides
   });
+}
+
+function deadlineProductionDependencies(
+  leaseStore: ScheduleLeaseStore,
+  broker: DeadlineProductionBrokerTransport
+): SchedulerDependencies {
+  return {
+    mode: "production",
+    clockKind: "system",
+    brokerKind: "rabbitmq",
+    clock: SYSTEM_RUNTIME_CLOCK,
+    feedSource: new ProductionTestFeedSource("ok", [
+      {
+        feedId: "feed-production",
+        feedUrl: "https://feeds.example.test/production.xml",
+        enabled: true,
+        cadenceMs: 60_000,
+        priority: 1,
+        shardIndex: 0,
+        shardCount: 1
+      }
+    ]),
+    leaseStore,
+    brokerTransport: broker,
+    brokerProbe: broker
+  };
 }
 
 function productionTestDependencies(
@@ -244,7 +334,10 @@ class ProductionTestFeedSource implements SchedulerFeedSource {
   readonly name = "backend-api-feed-source";
   readonly adapterKind = "backend-api" as const;
 
-  constructor(private readonly status: "ok" | "unhealthy") {}
+  constructor(
+    private readonly status: "ok" | "unhealthy",
+    private readonly feeds: readonly SchedulerFeedDefinition[] = []
+  ) {}
 
   probe() {
     return {
@@ -255,12 +348,64 @@ class ProductionTestFeedSource implements SchedulerFeedSource {
     } as const;
   }
 
-  listActiveFeeds(): readonly [] {
-    return [];
+  listActiveFeeds(): readonly SchedulerFeedDefinition[] {
+    return this.feeds;
   }
 
   countDueFeeds(): number {
-    return 0;
+    return this.feeds.length;
+  }
+}
+
+class DeadlineProductionLeaseStore implements ScheduleLeaseStore {
+  readonly name = "postgres-schedule-lease-store";
+  readonly adapterKind = "postgres" as const;
+  private readonly delegate = new InMemoryScheduleLeaseStore(
+    () => SYSTEM_RUNTIME_CLOCK.now()
+  );
+
+  probe() {
+    return this.delegate.probe();
+  }
+
+  acquire(command: ScheduleLeaseAcquireCommand) {
+    return this.delegate.acquire(command);
+  }
+
+  renew(token: string, leaseMs: number) {
+    return this.delegate.renew(token, leaseMs);
+  }
+
+  release(token: string, releasedAt: Date) {
+    return this.delegate.release(token, releasedAt);
+  }
+
+  markConfirmed(token: string, confirmedAt: Date, messageId: string) {
+    return this.delegate.markConfirmed(token, confirmedAt, messageId);
+  }
+
+  markFailed(token: string, failedAt: Date, reason: string) {
+    return this.delegate.markFailed(token, failedAt, reason);
+  }
+
+  get(idempotencyKey: string) {
+    return this.delegate.get(idempotencyKey);
+  }
+
+  close() {
+    return this.delegate.close();
+  }
+}
+
+class ShortRenewalProductionLeaseStore extends DeadlineProductionLeaseStore {
+  override async renew(token: string, leaseMs: number): Promise<ScheduleLeaseRecord> {
+    const renewed = await super.renew(token, leaseMs);
+    const checkedAtMs = Date.parse(renewed.ownershipCheckedAt ?? "");
+
+    return {
+      ...renewed,
+      leaseExpiresAt: new Date(checkedAtMs + 30_000).toISOString()
+    };
   }
 }
 
@@ -281,6 +426,14 @@ class ProductionTestLeaseStore implements ScheduleLeaseStore {
   }
 
   markConfirmed(): Promise<ScheduleLeaseRecord> {
+    return Promise.reject(new Error("not used"));
+  }
+
+  renew(): Promise<ScheduleLeaseRecord> {
+    return Promise.reject(new Error("not used"));
+  }
+
+  release(): Promise<ScheduleLeaseRecord> {
     return Promise.reject(new Error("not used"));
   }
 
@@ -338,6 +491,54 @@ class ProductionTestBrokerTransport implements RuntimeBrokerTransport {
   close(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+class DeadlineProductionBrokerTransport extends ProductionTestBrokerTransport {
+  readonly publishStarted = deferred<undefined>();
+  private readonly publishGate = deferred<undefined>();
+  private readonly publishCompleted = deferred<undefined>();
+  publishCount = 0;
+
+  override async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
+    this.publishCount += 1;
+    this.publishStarted.resolve(undefined);
+    await this.publishGate.promise;
+    const route = getWorkerRoute(command.envelope.route);
+
+    this.publishCompleted.resolve(undefined);
+    return {
+      messageId: command.envelope.messageId,
+      stage: command.envelope.route,
+      exchange: route.exchange,
+      routingKey: route.routingKey,
+      confirmed: true,
+      confirmedAt: new Date().toISOString()
+    };
+  }
+
+  async finishPublish(): Promise<void> {
+    this.publishGate.resolve(undefined);
+    await this.publishCompleted.promise;
+  }
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolveValue: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolveValue = resolve;
+  });
+
+  return {
+    promise,
+    resolve: (value) => {
+      resolveValue?.(value);
+    }
+  };
 }
 
 function requestUrl(input: Parameters<typeof fetch>[0] | undefined): string | undefined {

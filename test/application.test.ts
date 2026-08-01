@@ -27,8 +27,7 @@ describe("scheduler application lifecycle", () => {
     const config = loadSchedulerConfig({
       NUTSNEWS_SCHEDULER_HTTP_HOST: "127.0.0.1",
       NUTSNEWS_SCHEDULER_HTTP_PORT: "0",
-      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent",
-      NUTSNEWS_SCHEDULER_METRICS_ENABLED: "false"
+      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
     });
     const dependencies = createSchedulerApplicationDependencies();
     let releaseFeedRead: (() => void) | undefined;
@@ -62,8 +61,7 @@ describe("scheduler application lifecycle", () => {
     const config = loadSchedulerConfig({
       NUTSNEWS_SCHEDULER_HTTP_HOST: "127.0.0.1",
       NUTSNEWS_SCHEDULER_HTTP_PORT: "0",
-      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent",
-      NUTSNEWS_SCHEDULER_METRICS_ENABLED: "false"
+      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
     });
     const dependencies = createSchedulerApplicationDependencies();
     const connectGate = deferredSignal();
@@ -78,7 +76,12 @@ describe("scheduler application lifecycle", () => {
     expect((await fetch(liveUrl)).status).toBe(200);
     expect((await fetch(application.url("/startupz"))).status).toBe(503);
     expect((await fetch(application.url("/readyz"))).status).toBe(503);
-    expect((await fetch(application.url("/metrics"))).status).toBe(200);
+    const metricsResponse = await fetch(application.url("/metrics"));
+    const metrics = await metricsResponse.text();
+    expect(metricsResponse.status).toBe(200);
+    expect(metrics).toMatch(/nutsnews_worker_health_probe\{(?=[^\n}]*probe="liveness")(?=[^\n}]*outcome="ok")[^\n}]*\} 1/u);
+    expect(metrics).toMatch(/nutsnews_worker_health_probe\{(?=[^\n}]*probe="startup")(?=[^\n}]*outcome="unhealthy")[^\n}]*\} 1/u);
+    expect(metrics).toMatch(/nutsnews_worker_health_probe\{(?=[^\n}]*probe="readiness")(?=[^\n}]*outcome="unhealthy")[^\n}]*\} 1/u);
 
     connectGate.resolve();
     await startup;

@@ -14,7 +14,10 @@ import {
 import {
   createSchedulerFailClosedReconciler
 } from "../src/reconciliation.js";
-import { createSchedulerService } from "../src/service.js";
+import {
+  SCHEDULER_HEALTH_CHECK_NAMES,
+  createSchedulerService
+} from "../src/service.js";
 import {
   ManualSchedulerClock,
   createLocalSchedulerDependencies
@@ -45,6 +48,9 @@ describe("scheduler HTTP endpoints", () => {
         revision: config.buildRevision,
         deployment: "shadow",
         adapter: "in_memory"
+      },
+      cardinality: {
+        healthChecks: Object.values(SCHEDULER_HEALTH_CHECK_NAMES).flat()
       }
     });
     const service = createSchedulerService({
@@ -76,6 +82,7 @@ describe("scheduler HTTP endpoints", () => {
     expect(metricsBody).toContain("nutsnews_worker_last_success_timestamp_seconds");
     expect(metricsBody.match(/^# TYPE nutsnews_worker_health_probe gauge$/gmu)).toHaveLength(1);
     expect(metricsBody.match(/^# TYPE nutsnews_worker_health_check gauge$/gmu)).toHaveLength(1);
+    expect(metricsBody.match(/^# TYPE nutsnews_worker_health_check_duration_seconds histogram$/gmu)).toHaveLength(1);
     expect(metricsBody).toMatch(
       /nutsnews_worker_health_probe\{(?=[^\n}]*probe="readiness")(?=[^\n}]*outcome="ok")[^\n}]*\} 1/u
     );
@@ -84,6 +91,7 @@ describe("scheduler HTTP endpoints", () => {
     );
     expect(metricsBody).not.toMatch(/^# TYPE nutsnews_worker_health gauge$/mu);
     expect(metricsBody).not.toMatch(/^nutsnews_worker_health\{/mu);
+    expect(metricsBody).not.toContain('check="other"');
 
     const schemaResponse = await fetch(activeServer.url("/config-schema"));
     expect(schemaResponse.status).toBe(200);

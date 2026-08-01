@@ -26,7 +26,10 @@ import {
   type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
-import type { SchedulerConfig } from "./config.js";
+import {
+  SCHEDULER_PRODUCTION_MIN_LEASE_MS,
+  type SchedulerConfig
+} from "./config.js";
 import type { SchedulerDependencies } from "./dependencies.js";
 import {
   createCryptoSchedulerIdFactory,
@@ -37,6 +40,14 @@ import {
   type DueFeedDecision,
   type FeedScheduleDecision
 } from "./scheduling.js";
+import {
+  SchedulerPublishError,
+  schedulerPublishDisposition
+} from "./publish-error.js";
+import {
+  SCHEDULE_LEASE_MAX_MS,
+  type ScheduleLeaseRecord
+} from "./lease-store.js";
 import {
   bestEffortSchedulerMetricsSink,
   combineBestEffortTelemetrySinks,
@@ -60,6 +71,26 @@ export const SCHEDULER_CYCLE_DURATION_BUCKETS_SECONDS = [
   120,
   300
 ] as const;
+
+export const SCHEDULER_HEALTH_CHECK_NAMES = {
+  liveness: [
+    "process"
+  ],
+  startup: [
+    "service-started"
+  ],
+  readiness: [
+    "broker-lifecycle",
+    "rabbitmq-publisher",
+    "feed-source",
+    "schedule-lease-store",
+    "scheduler-loop",
+    "production-adapters"
+  ]
+} as const;
+
+export const SCHEDULER_PRODUCTION_PUBLISH_MIN_REMAINING_MS = 25_000;
+export const SCHEDULER_PRODUCTION_TERMINAL_MIN_REMAINING_MS = 10_000;
 
 type SchedulerCycleOutcome = "success" | "failure";
 interface SchedulerCycleHistogram {
@@ -95,7 +126,7 @@ export interface SchedulerService {
   readonly isSchedulingLoopActive: boolean;
   readonly lastSuccessAt: string | undefined;
   start(): Promise<void>;
-  setSchedulingLoopActive?(active: boolean): void;
+  setSchedulingLoopActive?(active: boolean): void | Promise<void>;
   /** Compatibility helper for isolated tests. Production scheduling is owned by createSchedulerLoop(). */
   startScheduling(): Promise<void>;
   runOnce(): Promise<SchedulerRunOnceResult>;
@@ -108,7 +139,10 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
   const fetchRoute = getWorkerRoute("fetch");
   const idFactory = options.idFactory ?? createCryptoSchedulerIdFactory();
   const metrics = bestEffortSchedulerMetricsSink(options.metrics);
-  const telemetry = combineBestEffortTelemetrySinks(options.telemetry, metrics);
+  const telemetry = combineBestEffortTelemetrySinks(
+    options.telemetry === options.metrics ? undefined : options.telemetry,
+    metrics
+  );
   const broker = createBrokerLifecycle({
     transport: options.dependencies.brokerTransport,
     routes: [
@@ -127,9 +161,9 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
   let lifecycleGeneration = 0;
   let lastSuccessAt: string | undefined;
   const cycleHistograms = new Map<SchedulerCycleOutcome, SchedulerCycleHistogram>();
-  recordRuntimeProbeMetric(metrics, options.dependencies.clock, "liveness", "ok");
-  recordRuntimeProbeMetric(metrics, options.dependencies.clock, "startup", "unhealthy");
-  recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
+  recordInitialRuntimeProbeMetric(metrics, options.dependencies.clock, "liveness", "ok");
+  recordInitialRuntimeProbeMetric(metrics, options.dependencies.clock, "startup", "unhealthy");
+  recordInitialRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
 
   const service: SchedulerService = {
     get broker(): BrokerLifecycle {
@@ -148,7 +182,6 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
           brokerDependencyReadinessCheck(options.dependencies),
           feedSourceReadinessCheck(options.dependencies),
           leaseStoreReadinessCheck(options.dependencies),
-          runtimeClockReadinessCheck(options.config, options.dependencies.clock),
           schedulingLoopReadinessCheck(
             options.config,
             options.dependencies,
@@ -206,11 +239,14 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
       }
 
       started = true;
-      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "startup", "ok");
-      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
       metrics?.setExpectedActive(!options.config.shadowMode);
       metrics?.setLastSuccessTimestamp(0);
       metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
+      await Promise.all([
+        service.health.liveness(),
+        service.health.startup(),
+        service.health.readiness()
+      ]);
       await emitRuntimeTelemetry(telemetry, {
         name: "runtime.dependency.observed",
         level: "info",
@@ -225,11 +261,11 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         }
       });
     },
-    setSchedulingLoopActive(active: boolean): void {
+    async setSchedulingLoopActive(active: boolean): Promise<void> {
       schedulingLoopActive = active;
 
       if (!active) {
-        recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
+        await service.health.readiness();
       }
     },
     async startScheduling(): Promise<void> {
@@ -333,49 +369,198 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
               }
             });
 
+            let command: ReturnType<typeof createFetchPublishCommand>;
+
             try {
-              const command = createFetchPublishCommand(decision, idFactory, options.config, checkedAt);
-              const receipt = await broker.publish(command);
-              await options.dependencies.leaseStore.markConfirmed(leaseResult.record.token, options.dependencies.clock.now(), receipt.messageId);
-              confirmedCount += 1;
-              await emitRuntimeTelemetry(telemetry, {
-                name: "runtime.message.accepted",
-                level: "info",
-                at: runtimeNow(options.dependencies.clock),
-                stage: "fetch",
-                queue: fetchRoute.mainQueue.name,
-                messageId: command.envelope.messageId,
-                idempotencyKey: command.envelope.idempotencyKey,
-                correlationId: command.envelope.correlationId,
-                traceparent: command.envelope.traceparent,
-                outcome: "success",
-                attributes: {
-                  event: "scheduler.feed.confirmed",
-                  dependency: "broker",
-                  feedId: decision.feed.feedId,
-                  windowStart: decision.window.start
-                }
-              });
+              command = createFetchPublishCommand(decision, idFactory, options.config, checkedAt);
             } catch (error: unknown) {
               failedCount += 1;
-              await options.dependencies.leaseStore.markFailed(leaseResult.record.token, options.dependencies.clock.now(), classifyScheduleError(error));
-              await emitRuntimeTelemetry(telemetry, {
-                name: "runtime.dependency.observed",
-                level: "error",
-                at: runtimeNow(options.dependencies.clock),
-                stage: "fetch",
-                queue: fetchRoute.mainQueue.name,
-                outcome: "failure",
-                attributes: {
-                  event: "scheduler.feed.failed",
-                  dependency: "broker",
-                  feedId: decision.feed.feedId,
-                  windowStart: decision.window.start,
-                  attemptCount: leaseResult.record.attemptCount,
-                  error: classifyScheduleError(error)
-                }
-              });
+              await safelyReleaseUnpublishedLease(
+                options,
+                telemetry,
+                leaseResult.record.token,
+                decision,
+                fetchRoute.mainQueue.name,
+                leaseResult.record.attemptCount,
+                "command-rejected"
+              );
+              await emitSchedulerFeedFailure(
+                telemetry,
+                options.dependencies.clock,
+                fetchRoute.mainQueue.name,
+                decision,
+                leaseResult.record.attemptCount,
+                "scheduler",
+                error,
+                "not-published"
+              );
+              continue;
             }
+
+            let leaseDeadlineAt: number | undefined;
+
+            if (options.config.dependencyMode === "production") {
+              const renewalStartedAt = performance.now();
+
+              try {
+                const renewed = await options.dependencies.leaseStore.renew(
+                  leaseResult.record.token,
+                  options.config.leaseMs
+                );
+                leaseDeadlineAt = renewalStartedAt + renewedLeaseDurationMs(
+                  renewed,
+                  leaseResult.record.token,
+                  options.config.leaseMs
+                );
+              } catch (error: unknown) {
+                failedCount += 1;
+                await emitSchedulerFeedFailure(
+                  telemetry,
+                  options.dependencies.clock,
+                  fetchRoute.mainQueue.name,
+                  decision,
+                  leaseResult.record.attemptCount,
+                  "lease-store",
+                  error,
+                  "ownership-uncertain"
+                );
+                continue;
+              }
+
+              if (leaseDeadlineAt - performance.now() < SCHEDULER_PRODUCTION_PUBLISH_MIN_REMAINING_MS) {
+                failedCount += 1;
+                const error = scheduleLeaseDeadlineError(
+                  "Renewed schedule lease did not leave enough bounded time to publish safely."
+                );
+                await safelyReleaseUnpublishedLease(
+                  options,
+                  telemetry,
+                  leaseResult.record.token,
+                  decision,
+                  fetchRoute.mainQueue.name,
+                  leaseResult.record.attemptCount,
+                  "publication-window-exhausted"
+                );
+                await emitSchedulerFeedFailure(
+                  telemetry,
+                  options.dependencies.clock,
+                  fetchRoute.mainQueue.name,
+                  decision,
+                  leaseResult.record.attemptCount,
+                  "lease-store",
+                  error,
+                  "not-published-deadline"
+                );
+                continue;
+              }
+            }
+
+            let receipt: Awaited<ReturnType<BrokerLifecycle["publish"]>>;
+
+            try {
+              receipt = await publishWithinLeaseDeadline(
+                () => broker.publish(command),
+                leaseDeadlineAt
+              );
+            } catch (error: unknown) {
+              failedCount += 1;
+              const disposition = schedulerPublishDisposition(error);
+
+              if (disposition === "not-published") {
+                await safelyReleaseUnpublishedLease(
+                  options,
+                  telemetry,
+                  leaseResult.record.token,
+                  decision,
+                  fetchRoute.mainQueue.name,
+                  leaseResult.record.attemptCount,
+                  disposition
+                );
+              } else if (disposition === "rejected") {
+                await safelyMarkRejectedLeaseFailed(
+                  options,
+                  telemetry,
+                  leaseResult.record.token,
+                  decision,
+                  fetchRoute.mainQueue.name,
+                  leaseResult.record.attemptCount,
+                  error
+                );
+              }
+
+              await emitSchedulerFeedFailure(
+                telemetry,
+                options.dependencies.clock,
+                fetchRoute.mainQueue.name,
+                decision,
+                leaseResult.record.attemptCount,
+                "broker",
+                error,
+                disposition
+              );
+              continue;
+            }
+
+            if (
+              leaseDeadlineAt !== undefined
+              && leaseDeadlineAt - performance.now() < SCHEDULER_PRODUCTION_TERMINAL_MIN_REMAINING_MS
+            ) {
+              failedCount += 1;
+              await emitSchedulerFeedFailure(
+                telemetry,
+                options.dependencies.clock,
+                fetchRoute.mainQueue.name,
+                decision,
+                leaseResult.record.attemptCount,
+                "lease-store",
+                scheduleLeaseDeadlineError(
+                  "Published work reached the terminal-fencing safety boundary before confirmation."
+                ),
+                "confirmation-deadline-exhausted"
+              );
+              continue;
+            }
+
+            try {
+              await options.dependencies.leaseStore.markConfirmed(
+                leaseResult.record.token,
+                options.dependencies.clock.now(),
+                receipt.messageId
+              );
+            } catch (error: unknown) {
+              failedCount += 1;
+              await emitSchedulerFeedFailure(
+                telemetry,
+                options.dependencies.clock,
+                fetchRoute.mainQueue.name,
+                decision,
+                leaseResult.record.attemptCount,
+                "lease-store",
+                error,
+                "confirmation-uncertain"
+              );
+              continue;
+            }
+
+            confirmedCount += 1;
+            await emitRuntimeTelemetry(telemetry, {
+              name: "runtime.message.accepted",
+              level: "info",
+              at: runtimeNow(options.dependencies.clock),
+              stage: "fetch",
+              queue: fetchRoute.mainQueue.name,
+              messageId: command.envelope.messageId,
+              idempotencyKey: command.envelope.idempotencyKey,
+              correlationId: command.envelope.correlationId,
+              traceparent: command.envelope.traceparent,
+              outcome: "success",
+              attributes: {
+                event: "scheduler.feed.confirmed",
+                dependency: "broker",
+                feedId: decision.feed.feedId,
+                windowStart: decision.window.start
+              }
+            });
           }
 
           await emitRuntimeTelemetry(telemetry, {
@@ -443,17 +628,18 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         return;
       }
 
-      schedulingLoopActive = false;
-
       drain.stopAcceptingWork();
       metrics?.setShutdownDraining(true);
+      await service.setSchedulingLoopActive?.(false);
       await drain.waitForDrain(options.config.shutdownTimeoutMs);
       await broker.stop("shutdown");
       await options.dependencies.leaseStore.close();
       metrics?.setShutdownDraining(false);
       started = false;
-      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "startup", "unhealthy");
-      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
+      await Promise.all([
+        service.health.startup(),
+        service.health.readiness()
+      ]);
     }
   };
 
@@ -496,6 +682,186 @@ async function acquireScheduleLease(
 
     return undefined;
   }
+}
+
+function renewedLeaseDurationMs(
+  record: ScheduleLeaseRecord,
+  expectedToken: string,
+  configuredLeaseMs: number
+): number {
+  if (
+    record.token !== expectedToken
+    || record.status !== "leased"
+    || record.ownershipCheckedAt === undefined
+  ) {
+    throw scheduleLeaseDeadlineError(
+      "Schedule lease renewal did not prove current ownership of the requested token."
+    );
+  }
+
+  const checkedAtMs = Date.parse(record.ownershipCheckedAt);
+  const expiresAtMs = Date.parse(record.leaseExpiresAt);
+  const durationMs = expiresAtMs - checkedAtMs;
+
+  if (
+    !Number.isSafeInteger(durationMs)
+    || durationMs !== configuredLeaseMs
+    || durationMs < SCHEDULER_PRODUCTION_MIN_LEASE_MS
+    || durationMs > SCHEDULE_LEASE_MAX_MS
+  ) {
+    throw scheduleLeaseDeadlineError(
+      "Schedule lease renewal returned an invalid or unsafe server-clock duration."
+    );
+  }
+
+  return durationMs;
+}
+
+async function publishWithinLeaseDeadline<T>(
+  startPublication: () => Promise<T>,
+  leaseDeadlineAt: number | undefined
+): Promise<T> {
+  if (leaseDeadlineAt === undefined) {
+    return startPublication();
+  }
+
+  const publishBudgetMs = leaseDeadlineAt
+    - performance.now()
+    - SCHEDULER_PRODUCTION_TERMINAL_MIN_REMAINING_MS;
+
+  if (!Number.isFinite(publishBudgetMs) || publishBudgetMs <= 0) {
+    throw new SchedulerPublishError(
+      "Schedule lease publication window closed before the broker call started.",
+      "not-published"
+    );
+  }
+
+  let publication: Promise<T>;
+
+  try {
+    publication = startPublication();
+  } catch (error: unknown) {
+    throw new SchedulerPublishError(
+      "Broker publication failed synchronously before it could be accepted.",
+      "not-published",
+      {
+        cause: error
+      }
+    );
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      publication,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new SchedulerPublishError(
+            "Broker publication exceeded the schedule lease confirmation window.",
+            "ambiguous"
+          ));
+        }, publishBudgetMs);
+      })
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function scheduleLeaseDeadlineError(message: string): Error {
+  const error = new Error(message);
+
+  error.name = "ScheduleLeaseDeadlineError";
+  return error;
+}
+
+async function safelyReleaseUnpublishedLease(
+  options: SchedulerServiceOptions,
+  telemetry: RuntimeTelemetrySink | undefined,
+  token: string,
+  decision: DueFeedDecision,
+  queueName: string,
+  attemptCount: number,
+  reason: string
+): Promise<void> {
+  try {
+    await options.dependencies.leaseStore.release(
+      token,
+      options.dependencies.clock.now()
+    );
+  } catch (error: unknown) {
+    await emitSchedulerFeedFailure(
+      telemetry,
+      options.dependencies.clock,
+      queueName,
+      decision,
+      attemptCount,
+      "lease-store",
+      error,
+      `${reason}-release-uncertain`
+    );
+  }
+}
+
+async function safelyMarkRejectedLeaseFailed(
+  options: SchedulerServiceOptions,
+  telemetry: RuntimeTelemetrySink | undefined,
+  token: string,
+  decision: DueFeedDecision,
+  queueName: string,
+  attemptCount: number,
+  publishError: unknown
+): Promise<void> {
+  try {
+    await options.dependencies.leaseStore.markFailed(
+      token,
+      options.dependencies.clock.now(),
+      classifyScheduleError(publishError)
+    );
+  } catch (error: unknown) {
+    await emitSchedulerFeedFailure(
+      telemetry,
+      options.dependencies.clock,
+      queueName,
+      decision,
+      attemptCount,
+      "lease-store",
+      error,
+      "rejected-finalization-uncertain"
+    );
+  }
+}
+
+async function emitSchedulerFeedFailure(
+  telemetry: RuntimeTelemetrySink | undefined,
+  clock: RuntimeClock,
+  queueName: string,
+  decision: DueFeedDecision,
+  attemptCount: number,
+  dependency: "broker" | "lease-store" | "scheduler",
+  error: unknown,
+  disposition: string
+): Promise<void> {
+  await emitRuntimeTelemetry(telemetry, {
+    name: "runtime.dependency.observed",
+    level: "error",
+    at: runtimeNow(clock),
+    stage: "fetch",
+    queue: queueName,
+    outcome: "failure",
+    attributes: {
+      event: "scheduler.feed.failed",
+      dependency,
+      feedId: decision.feed.feedId,
+      windowStart: decision.window.start,
+      attemptCount,
+      disposition,
+      error: classifyScheduleError(error)
+    }
+  });
 }
 
 function createFetchPublishCommand(
@@ -593,7 +959,7 @@ function classifyScheduleError(error: unknown): string {
 
 function livenessCheck(): RuntimeHealthCheck {
   return {
-    name: "process",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.liveness[0],
     critical: true,
     check: () => "ok"
   };
@@ -601,7 +967,7 @@ function livenessCheck(): RuntimeHealthCheck {
 
 function startupCheck(isStarted: () => boolean): RuntimeHealthCheck {
   return {
-    name: "service-started",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.startup[0],
     critical: true,
     check: () => isStarted() ? "ok" : "unhealthy"
   };
@@ -609,7 +975,7 @@ function startupCheck(isStarted: () => boolean): RuntimeHealthCheck {
 
 function brokerReadinessCheck(broker: BrokerLifecycle): RuntimeHealthCheck {
   return {
-    name: "broker-lifecycle",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.readiness[0],
     critical: true,
     check: () => broker.state === "ready"
       ? {
@@ -629,7 +995,7 @@ function brokerReadinessCheck(broker: BrokerLifecycle): RuntimeHealthCheck {
 
 function feedSourceReadinessCheck(dependencies: SchedulerDependencies): RuntimeHealthCheck {
   return {
-    name: "feed-source",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.readiness[2],
     critical: true,
     check: async () => {
       const probe = await dependencies.feedSource.probe();
@@ -647,7 +1013,7 @@ function feedSourceReadinessCheck(dependencies: SchedulerDependencies): RuntimeH
 
 function brokerDependencyReadinessCheck(dependencies: SchedulerDependencies): RuntimeHealthCheck {
   return {
-    name: "rabbitmq-publisher",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.readiness[1],
     critical: true,
     check: async () => {
       const probe = await dependencies.brokerProbe.probe();
@@ -665,7 +1031,7 @@ function brokerDependencyReadinessCheck(dependencies: SchedulerDependencies): Ru
 
 function leaseStoreReadinessCheck(dependencies: SchedulerDependencies): RuntimeHealthCheck {
   return {
-    name: "schedule-lease-store",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.readiness[3],
     critical: true,
     check: async () => {
       const probe = await dependencies.leaseStore.probe();
@@ -677,40 +1043,6 @@ function leaseStoreReadinessCheck(dependencies: SchedulerDependencies): RuntimeH
           summary: probe.summary
         }
       };
-    }
-  };
-}
-
-function runtimeClockReadinessCheck(
-  config: SchedulerConfig,
-  clock: RuntimeClock
-): RuntimeHealthCheck {
-  return {
-    name: "runtime-clock",
-    critical: true,
-    check: () => {
-      if (config.dependencyMode !== "production") {
-        return "ok";
-      }
-
-      const skewMs = Math.abs(Date.now() - clock.now().getTime());
-
-      return skewMs <= 5_000
-        ? {
-            status: "ok",
-            details: {
-              source: "system-runtime-clock",
-              freshnessBoundMs: 5_000
-            }
-          }
-        : {
-            status: "unhealthy",
-            details: {
-              source: "system-runtime-clock",
-              reason: "clock-outside-freshness-bound",
-              freshnessBoundMs: 5_000
-            }
-          };
     }
   };
 }
@@ -749,7 +1081,7 @@ function schedulingLoopReadinessCheck(
   latestSuccessAt: () => string | undefined
 ): RuntimeHealthCheck {
   return {
-    name: "scheduler-loop",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.readiness[4],
     critical: true,
     check: () => config.dependencyMode !== "production" || schedulingLoopIsFresh(
       config,
@@ -796,7 +1128,7 @@ function productionAdaptersReadinessCheck(
   dependencies: SchedulerDependencies
 ): RuntimeHealthCheck {
   return {
-    name: "production-adapters",
+    name: SCHEDULER_HEALTH_CHECK_NAMES.readiness[5],
     critical: true,
     check: () => {
       const adapter = aggregateAdapterMode(dependencies);
@@ -926,7 +1258,7 @@ function collectSchedulerCycleMetrics(
   return lines;
 }
 
-function recordRuntimeProbeMetric(
+function recordInitialRuntimeProbeMetric(
   metrics: SchedulerMetricsSink | undefined,
   clock: RuntimeClock,
   probe: RuntimeHealthProbe,

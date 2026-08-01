@@ -58,7 +58,7 @@ export function createSchedulerLoop(options: SchedulerLoopOptions): SchedulerLoo
       }
 
       running = true;
-      options.service.setSchedulingLoopActive?.(true);
+      void options.service.setSchedulingLoopActive?.(true);
       const initialDelayMs = options.initialDelayMs ?? 0;
 
       if (initialDelayMs === 0) {
@@ -70,7 +70,6 @@ export function createSchedulerLoop(options: SchedulerLoopOptions): SchedulerLoo
     },
     async stop(): Promise<void> {
       running = false;
-      options.service.setSchedulingLoopActive?.(false);
 
       if (timer !== undefined) {
         clearTimer(timer);
@@ -78,6 +77,7 @@ export function createSchedulerLoop(options: SchedulerLoopOptions): SchedulerLoo
       }
 
       await inFlight;
+      await options.service.setSchedulingLoopActive?.(false);
     }
   };
 }

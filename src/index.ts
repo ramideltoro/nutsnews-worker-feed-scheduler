@@ -23,7 +23,10 @@ import {
 import {
   createSchedulerFailClosedReconciler
 } from "./reconciliation.js";
-import { createSchedulerService } from "./service.js";
+import {
+  SCHEDULER_HEALTH_CHECK_NAMES,
+  createSchedulerService
+} from "./service.js";
 import {
   bestEffortSchedulerMetricsSink,
   bestEffortTelemetryFlusher
@@ -32,6 +35,7 @@ import { createLocalSchedulerDependencies } from "./test-doubles.js";
 
 export {
   SCHEDULER_CONFIG_SCHEMA,
+  SCHEDULER_PRODUCTION_MIN_LEASE_MS,
   SCHEDULER_SERVICE_NAME,
   SCHEDULER_SERVICE_VERSION,
   loadSchedulerConfig,
@@ -63,6 +67,11 @@ export {
   type SchedulerRabbitMqPublisherOptions
 } from "./rabbitmq-publisher.js";
 export {
+  SchedulerPublishError,
+  schedulerPublishDisposition,
+  type SchedulerPublishDisposition
+} from "./publish-error.js";
+export {
   SCHEDULER_RECONCILIATION_CONFIRMATION,
   SCHEDULER_RECONCILIATION_PATH,
   createSchedulerFailClosedReconciler,
@@ -72,6 +81,7 @@ export {
 } from "./reconciliation.js";
 export {
   SCHEDULER_CYCLE_DURATION_BUCKETS_SECONDS,
+  SCHEDULER_HEALTH_CHECK_NAMES,
   createSchedulerService,
   type SchedulerRunOnceResult,
   type SchedulerService
@@ -89,6 +99,9 @@ export {
 } from "./fixtures.js";
 export {
   InMemoryScheduleLeaseStore,
+  SCHEDULE_LEASE_MAX_MS,
+  ScheduleLeaseOwnershipError,
+  assertScheduleLeaseDuration,
   type ScheduleLeaseRecord,
   type ScheduleLeaseStore
 } from "./lease-store.js";
@@ -144,17 +157,7 @@ export function createSchedulerApplication(
         "lease-store",
         "broker"
       ],
-      healthChecks: [
-        "process",
-        "service-started",
-        "broker-lifecycle",
-        "feed-source",
-        "rabbitmq-publisher",
-        "schedule-lease-store",
-        "runtime-clock",
-        "scheduler-loop",
-        "production-adapters"
-      ]
+      healthChecks: Object.values(SCHEDULER_HEALTH_CHECK_NAMES).flat()
     },
     expectedActive: !config.shadowMode
   } as const;

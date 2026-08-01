@@ -1,7 +1,9 @@
 import type { SchedulerWindow } from "./scheduling.js";
 import type { SchedulerDependencyProbe } from "./dependencies.js";
 
-export type ScheduleLeaseStatus = "leased" | "confirmed" | "failed";
+export const SCHEDULE_LEASE_MAX_MS = 300_000;
+
+export type ScheduleLeaseStatus = "leased" | "confirmed" | "failed" | "released" | "expired";
 export type ScheduleLeaseAcquireStatus = "acquired" | "already_confirmed" | "lease_active";
 
 export interface ScheduleLeaseAcquireCommand {
@@ -20,9 +22,11 @@ export interface ScheduleLeaseRecord {
   readonly status: ScheduleLeaseStatus;
   readonly acquiredAt: string;
   readonly leaseExpiresAt: string;
+  readonly ownershipCheckedAt?: string;
   readonly attemptCount: number;
   readonly confirmedAt?: string;
   readonly failedAt?: string;
+  readonly releasedAt?: string;
   readonly failureReason?: string;
   readonly publishReceiptMessageId?: string;
 }
@@ -42,6 +46,8 @@ export interface ScheduleLeaseStore {
   readonly adapterKind: "in-memory-test" | "postgres";
   probe(): Promise<SchedulerDependencyProbe>;
   acquire(command: ScheduleLeaseAcquireCommand): Promise<ScheduleLeaseAcquireResult>;
+  renew(token: string, leaseMs: number): Promise<ScheduleLeaseRecord>;
+  release(token: string, releasedAt: Date): Promise<ScheduleLeaseRecord>;
   markConfirmed(token: string, confirmedAt: Date, publishReceiptMessageId: string): Promise<ScheduleLeaseRecord>;
   markFailed(token: string, failedAt: Date, failureReason: string): Promise<ScheduleLeaseRecord>;
   get(idempotencyKey: string): Promise<ScheduleLeaseRecord | undefined>;
@@ -54,6 +60,8 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
   private readonly records = new Map<string, ScheduleLeaseRecord>();
   private tokenCounter = 0;
 
+  constructor(private readonly now: () => Date = () => new Date()) {}
+
   probe(): Promise<SchedulerDependencyProbe> {
     return Promise.resolve({
       status: "ok",
@@ -62,6 +70,8 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
   }
 
   acquire(command: ScheduleLeaseAcquireCommand): Promise<ScheduleLeaseAcquireResult> {
+    assertScheduleLeaseDuration(command.leaseMs);
+    const acquiredAt = this.now();
     const existing = this.records.get(command.idempotencyKey);
 
     if (existing?.status === "confirmed") {
@@ -71,7 +81,7 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
       });
     }
 
-    if (existing?.status === "leased" && Date.parse(existing.leaseExpiresAt) > command.now.getTime()) {
+    if (existing?.status === "leased" && Date.parse(existing.leaseExpiresAt) > acquiredAt.getTime()) {
       return Promise.resolve({
         status: "lease_active",
         record: existing
@@ -85,8 +95,9 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
       idempotencyKey: command.idempotencyKey,
       window: command.window,
       status: "leased",
-      acquiredAt: command.now.toISOString(),
-      leaseExpiresAt: new Date(command.now.getTime() + command.leaseMs).toISOString(),
+      acquiredAt: acquiredAt.toISOString(),
+      leaseExpiresAt: new Date(acquiredAt.getTime() + command.leaseMs).toISOString(),
+      ownershipCheckedAt: acquiredAt.toISOString(),
       attemptCount
     };
 
@@ -98,12 +109,42 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
     });
   }
 
+  renew(token: string, leaseMs: number): Promise<ScheduleLeaseRecord> {
+    assertScheduleLeaseDuration(leaseMs);
+    const renewedAt = this.now();
+    const [key, existing] = this.findUnexpiredLeasedToken(token, renewedAt);
+    const record: ScheduleLeaseRecord = {
+      ...existing,
+      leaseExpiresAt: new Date(renewedAt.getTime() + leaseMs).toISOString(),
+      ownershipCheckedAt: renewedAt.toISOString()
+    };
+
+    this.records.set(key, record);
+    return Promise.resolve(record);
+  }
+
+  release(token: string, releasedAt: Date): Promise<ScheduleLeaseRecord> {
+    void releasedAt;
+    const operationAt = this.now();
+    const [key, existing] = this.findUnexpiredLeasedToken(token, operationAt);
+    const record: ScheduleLeaseRecord = {
+      ...existing,
+      status: "released",
+      releasedAt: operationAt.toISOString()
+    };
+
+    this.records.set(key, record);
+    return Promise.resolve(record);
+  }
+
   markConfirmed(token: string, confirmedAt: Date, publishReceiptMessageId: string): Promise<ScheduleLeaseRecord> {
-    const [key, existing] = this.findByToken(token);
+    void confirmedAt;
+    const operationAt = this.now();
+    const [key, existing] = this.findUnexpiredLeasedToken(token, operationAt);
     const record: ScheduleLeaseRecord = {
       ...existing,
       status: "confirmed",
-      confirmedAt: confirmedAt.toISOString(),
+      confirmedAt: operationAt.toISOString(),
       publishReceiptMessageId
     };
 
@@ -112,11 +153,13 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
   }
 
   markFailed(token: string, failedAt: Date, failureReason: string): Promise<ScheduleLeaseRecord> {
-    const [key, existing] = this.findByToken(token);
+    void failedAt;
+    const operationAt = this.now();
+    const [key, existing] = this.findUnexpiredLeasedToken(token, operationAt);
     const record: ScheduleLeaseRecord = {
       ...existing,
       status: "failed",
-      failedAt: failedAt.toISOString(),
+      failedAt: operationAt.toISOString(),
       failureReason
     };
 
@@ -144,6 +187,33 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
       }
     }
 
-    throw new Error(`Unknown schedule lease token ${token}.`);
+    throw new ScheduleLeaseOwnershipError(`Unknown or stale schedule lease token ${token}.`);
+  }
+
+  private findUnexpiredLeasedToken(
+    token: string,
+    operationAt: Date
+  ): readonly [string, ScheduleLeaseRecord] {
+    const entry = this.findByToken(token);
+    const record = entry[1];
+
+    if (record.status !== "leased" || Date.parse(record.leaseExpiresAt) <= operationAt.getTime()) {
+      throw new ScheduleLeaseOwnershipError("Schedule lease ownership is absent or expired.");
+    }
+
+    return entry;
+  }
+}
+
+export class ScheduleLeaseOwnershipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduleLeaseOwnershipError";
+  }
+}
+
+export function assertScheduleLeaseDuration(leaseMs: number): void {
+  if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > SCHEDULE_LEASE_MAX_MS) {
+    throw new RangeError(`Schedule lease duration must be an integer from 1000 through ${String(SCHEDULE_LEASE_MAX_MS)} milliseconds.`);
   }
 }

@@ -49,6 +49,44 @@ describe("loadSchedulerConfig", () => {
     expect(config.dependencies.rabbitmqConfigured).toBe(true);
   });
 
+  it("reserves at least 60 seconds for bounded production publication", () => {
+    const production = {
+      NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "production",
+      NUTSNEWS_SCHEDULER_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
+      NUTSNEWS_SCHEDULER_DATABASE_URL: "postgres://configured",
+      NUTSNEWS_SCHEDULER_BACKEND_API_URL: "https://backend.example.test",
+      NUTSNEWS_SCHEDULER_BACKEND_API_TOKEN: "configured",
+      NUTSNEWS_SCHEDULER_RABBITMQ_URL: "amqps://configured"
+    } as const;
+
+    expect(loadSchedulerConfig({
+      ...production,
+      NUTSNEWS_SCHEDULER_CADENCE_MS: "60000",
+      NUTSNEWS_SCHEDULER_LEASE_MS: "60000"
+    }).leaseMs).toBe(60_000);
+
+    expect(() => loadSchedulerConfig({
+      ...production,
+      NUTSNEWS_SCHEDULER_CADENCE_MS: "30000",
+      NUTSNEWS_SCHEDULER_LEASE_MS: "30000"
+    })).toThrow(/LEASE_MS must be at least 60000 in production/u);
+  });
+
+  it("accepts a lease equal to cadence and rejects values above the 300-second contract", () => {
+    expect(loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_CADENCE_MS: "300000",
+      NUTSNEWS_SCHEDULER_LEASE_MS: "300000"
+    }).leaseMs).toBe(300_000);
+
+    expect(() => loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_LEASE_MS: "300001"
+    })).toThrow(/LEASE_MS must be an integer between 1000 and 300000/u);
+
+    expect(() => loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_LEASE_MS: "900000"
+    })).toThrow(/LEASE_MS must be an integer between 1000 and 300000/u);
+  });
+
   it("rejects an unknown build revision in production dependency mode", () => {
     expect(() => loadSchedulerConfig({
       NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "production",
