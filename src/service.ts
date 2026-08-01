@@ -20,9 +20,8 @@ import {
   type BrokerLifecycle,
   type RuntimeClock,
   type RuntimeHealthCheck,
-  type RuntimeHealthProbe,
   type RuntimeHealthProbeSet,
-  type RuntimeHealthReport,
+  type RuntimeHealthProbe,
   type RuntimeHealthStatus,
   type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
@@ -40,7 +39,7 @@ import {
 } from "./scheduling.js";
 import {
   bestEffortSchedulerMetricsSink,
-  bestEffortTelemetrySink,
+  combineBestEffortTelemetrySinks,
   type SchedulerMetricsSink
 } from "./telemetry-safety.js";
 
@@ -63,8 +62,6 @@ export const SCHEDULER_CYCLE_DURATION_BUCKETS_SECONDS = [
 ] as const;
 
 type SchedulerCycleOutcome = "success" | "failure";
-type SchedulerHealthProbe = Extract<RuntimeHealthProbe, "liveness" | "startup" | "readiness">;
-
 interface SchedulerCycleHistogram {
   readonly buckets: number[];
   count: number;
@@ -110,8 +107,8 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
   assertSchedulerDependencyBoundary(options.config, options.dependencies);
   const fetchRoute = getWorkerRoute("fetch");
   const idFactory = options.idFactory ?? createCryptoSchedulerIdFactory();
-  const telemetry = bestEffortTelemetrySink(options.telemetry);
   const metrics = bestEffortSchedulerMetricsSink(options.metrics);
+  const telemetry = combineBestEffortTelemetrySinks(options.telemetry, metrics);
   const broker = createBrokerLifecycle({
     transport: options.dependencies.brokerTransport,
     routes: [
@@ -130,18 +127,16 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
   let lifecycleGeneration = 0;
   let lastSuccessAt: string | undefined;
   const cycleHistograms = new Map<SchedulerCycleOutcome, SchedulerCycleHistogram>();
-  const healthStates = new Map<SchedulerHealthProbe, RuntimeHealthStatus>([
-    ["liveness", "ok"],
-    ["startup", "unhealthy"],
-    ["readiness", "unhealthy"]
-  ]);
+  recordRuntimeProbeMetric(metrics, options.dependencies.clock, "liveness", "ok");
+  recordRuntimeProbeMetric(metrics, options.dependencies.clock, "startup", "unhealthy");
+  recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
 
   const service: SchedulerService = {
     get broker(): BrokerLifecycle {
       return broker;
     },
     get health(): RuntimeHealthProbeSet {
-      return observeHealthProbeSet(createRuntimeHealthProbeSet({
+      return createRuntimeHealthProbeSet({
         livenessChecks: [
           livenessCheck()
         ],
@@ -166,7 +161,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         ...(telemetry === undefined ? {} : {
           telemetry
         })
-      }), healthStates);
+      });
     },
     get isStarted(): boolean {
       return started;
@@ -211,11 +206,10 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
       }
 
       started = true;
-      healthStates.set("startup", "ok");
-      healthStates.set("readiness", "unhealthy");
-      const operationalSignals = runtimeOperationalSignals(metrics);
-      operationalSignals?.setExpectedActive(!options.config.shadowMode);
-      operationalSignals?.setLastSuccessTimestamp(0);
+      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "startup", "ok");
+      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
+      metrics?.setExpectedActive(!options.config.shadowMode);
+      metrics?.setLastSuccessTimestamp(0);
       metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
       await emitRuntimeTelemetry(telemetry, {
         name: "runtime.dependency.observed",
@@ -235,7 +229,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
       schedulingLoopActive = active;
 
       if (!active) {
-        healthStates.set("readiness", "unhealthy");
+        recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
       }
     },
     async startScheduling(): Promise<void> {
@@ -405,7 +399,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
 
           if (failedCount === 0) {
             lastSuccessAt = runtimeNow(options.dependencies.clock);
-            runtimeOperationalSignals(metrics)?.setLastSuccessTimestamp(
+            metrics?.setLastSuccessTimestamp(
               Math.floor(new Date(lastSuccessAt).getTime() / 1_000)
             );
           }
@@ -429,9 +423,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
 
         if (started) {
-          await service.health.readiness().catch(() => {
-            healthStates.set("readiness", "unhealthy");
-          });
+          await service.health.readiness().catch(() => undefined);
         }
       }
     },
@@ -441,9 +433,6 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         options.dependencies,
         schedulingLoopActive,
         schedulingLoopIsFresh(options.config, options.dependencies, schedulingLoopActive, lastSuccessAt),
-        lastSuccessAt,
-        runtimeOperationalSignals(metrics) === undefined,
-        healthStates,
         cycleHistograms
       );
     },
@@ -463,8 +452,8 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
       await options.dependencies.leaseStore.close();
       metrics?.setShutdownDraining(false);
       started = false;
-      healthStates.set("startup", "unhealthy");
-      healthStates.set("readiness", "unhealthy");
+      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "startup", "unhealthy");
+      recordRuntimeProbeMetric(metrics, options.dependencies.clock, "readiness", "unhealthy");
     }
   };
 
@@ -846,107 +835,23 @@ function collectSchedulerOperationalMetrics(
   dependencies: SchedulerDependencies,
   loopActive: boolean,
   loopFresh: boolean,
-  latestSuccessAt: string | undefined,
-  includeCompatibilityIdentity: boolean,
-  healthStates: ReadonlyMap<SchedulerHealthProbe, RuntimeHealthStatus>,
   cycleHistograms: ReadonlyMap<SchedulerCycleOutcome, SchedulerCycleHistogram>
 ): string {
   const identity = {
     environment: config.environment,
     service: config.serviceName
   };
-  const adapter = metricAdapterMode(aggregateAdapterMode(dependencies));
-  const deployment = config.shadowMode ? "shadow" : "production";
-  const lastSuccessTimestamp = latestSuccessAt === undefined
-    ? 0
-    : Math.floor(new Date(latestSuccessAt).getTime() / 1_000);
-  const compatibilityLines = includeCompatibilityIdentity
-    ? [
-        "# HELP nutsnews_worker_build_info Worker build identity; revision changes create one bounded deploy series.",
-        "# TYPE nutsnews_worker_build_info gauge",
-        metricLine("nutsnews_worker_build_info", {
-          ...identity,
-          version: config.serviceVersion,
-          revision: config.buildRevision
-        }, 1),
-        "# HELP nutsnews_worker_deployment_info Worker deployment and dependency-adapter mode.",
-        "# TYPE nutsnews_worker_deployment_info gauge",
-        metricLine("nutsnews_worker_deployment_info", {
-          ...identity,
-          deployment,
-          adapter
-        }, 1),
-        "# HELP nutsnews_worker_expected_active Whether this deployment is expected to own active production work.",
-        "# TYPE nutsnews_worker_expected_active gauge",
-        metricLine("nutsnews_worker_expected_active", identity, config.shadowMode ? 0 : 1),
-        "# HELP nutsnews_worker_last_success_timestamp_seconds Unix timestamp of the latest service-owned successful work cycle.",
-        "# TYPE nutsnews_worker_last_success_timestamp_seconds gauge",
-        metricLine("nutsnews_worker_last_success_timestamp_seconds", identity, lastSuccessTimestamp)
-      ]
-    : [];
   const lines = [
-    ...compatibilityLines,
     "# HELP nutsnews_worker_scheduler_loop_active Whether the scheduler loop is active.",
     "# TYPE nutsnews_worker_scheduler_loop_active gauge",
     metricLine("nutsnews_worker_scheduler_loop_active", identity, loopActive ? 1 : 0),
     "# HELP nutsnews_worker_scheduler_loop_fresh Whether the active scheduler loop completed successfully within three cadences.",
     "# TYPE nutsnews_worker_scheduler_loop_fresh gauge",
     metricLine("nutsnews_worker_scheduler_loop_fresh", identity, loopFresh ? 1 : 0),
-    ...collectHealthProbeMetrics(identity, healthStates),
     ...collectSchedulerCycleMetrics(identity, cycleHistograms)
   ];
 
   return `${lines.join("\n")}\n`;
-}
-
-function observeHealthProbeSet(
-  probes: RuntimeHealthProbeSet,
-  healthStates: Map<SchedulerHealthProbe, RuntimeHealthStatus>
-): RuntimeHealthProbeSet {
-  const observe = async (
-    probe: SchedulerHealthProbe,
-    evaluate: () => Promise<RuntimeHealthReport>
-  ): Promise<RuntimeHealthReport> => {
-    try {
-      const report = await evaluate();
-
-      healthStates.set(probe, report.status);
-      return report;
-    } catch (error: unknown) {
-      healthStates.set(probe, "unhealthy");
-      throw error;
-    }
-  };
-
-  return {
-    liveness: () => observe("liveness", () => probes.liveness()),
-    startup: () => observe("startup", () => probes.startup()),
-    readiness: () => observe("readiness", () => probes.readiness())
-  };
-}
-
-function collectHealthProbeMetrics(
-  identity: Readonly<Record<string, string>>,
-  healthStates: ReadonlyMap<SchedulerHealthProbe, RuntimeHealthStatus>
-): string[] {
-  const lines = [
-    "# HELP nutsnews_worker_health_probe Worker liveness, startup, and readiness state by bounded probe and outcome.",
-    "# TYPE nutsnews_worker_health_probe gauge"
-  ];
-
-  for (const probe of ["liveness", "startup", "readiness"] as const) {
-    const current = healthStates.get(probe) ?? "unhealthy";
-
-    for (const outcome of ["ok", "degraded", "unhealthy"] as const) {
-      lines.push(metricLine("nutsnews_worker_health_probe", {
-        ...identity,
-        probe,
-        outcome
-      }, current === outcome ? 1 : 0));
-    }
-  }
-
-  return lines;
 }
 
 function observeSchedulerCycle(
@@ -1021,31 +926,24 @@ function collectSchedulerCycleMetrics(
   return lines;
 }
 
-function metricAdapterMode(
-  adapter: ReturnType<typeof aggregateAdapterMode>
-): "in_memory" | "production" | "mixed" | "unknown" {
-  return adapter === "local" ? "in_memory" : adapter;
-}
-
-interface RuntimeOperationalSignals {
-  setExpectedActive(expected: boolean): void;
-  setLastSuccessTimestamp(timestampSeconds: number): void;
-}
-
-function runtimeOperationalSignals(
-  metrics: SchedulerMetricsSink | undefined
-): RuntimeOperationalSignals | undefined {
-  if (
-    metrics !== undefined
-    && "setExpectedActive" in metrics
-    && typeof metrics.setExpectedActive === "function"
-    && "setLastSuccessTimestamp" in metrics
-    && typeof metrics.setLastSuccessTimestamp === "function"
-  ) {
-    return metrics as SchedulerMetricsSink & RuntimeOperationalSignals;
-  }
-
-  return undefined;
+function recordRuntimeProbeMetric(
+  metrics: SchedulerMetricsSink | undefined,
+  clock: RuntimeClock,
+  probe: RuntimeHealthProbe,
+  status: RuntimeHealthStatus
+): void {
+  void metrics?.emit({
+    name: "runtime.health.evaluated",
+    level: status === "ok" ? "info" : "warn",
+    at: runtimeNow(clock),
+    outcome: status,
+    attributes: {
+      probe,
+      status,
+      checkCount: 0,
+      checks: []
+    }
+  });
 }
 
 function metricLine(

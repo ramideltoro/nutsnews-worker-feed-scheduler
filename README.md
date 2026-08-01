@@ -28,8 +28,8 @@ The image runs as a non-root user, exposes port `8080`, and serves:
 
 The service consumes exact immutable worker-uplift package versions:
 
-- `@ramideltoro/nutsnews-worker-contracts@0.3.1`
-- `@ramideltoro/nutsnews-worker-runtime@0.4.0`
+- `@ramideltoro/nutsnews-worker-contracts@1.0.0`
+- `@ramideltoro/nutsnews-worker-runtime@1.0.0`
 
 Local and CI installs use the owner-scoped GitHub Packages npm registry. No package token value is committed.
 
@@ -82,7 +82,7 @@ The scheduler evaluates active feed definitions with an injectable clock:
 
 The deployed loop runs once immediately after startup, then waits one configured cadence after each completed run. Runs never overlap. The backend shadow deployment currently bounds each run to one newly acquired feed window; the durable lease prevents repeated publication of the same feed/window across restarts or concurrent replicas.
 
-Published fetch requests validate against `@ramideltoro/nutsnews-worker-contracts@0.3.1`. Schedule-window metadata is carried inside the payload `limits` object while correlation and idempotency live on the worker envelope.
+Published fetch requests validate against `@ramideltoro/nutsnews-worker-contracts@1.0.0`. Schedule-window metadata is carried inside the payload `limits` object while correlation and idempotency live on the worker envelope.
 
 ## Concurrency and Recovery Proof
 
@@ -98,7 +98,7 @@ The scheduler proof suite covers:
 
 Failure telemetry identifies `feedId`, `windowStart`, `attemptCount` when available, `idempotencyKey` for lease failures, and the failing dependency (`lease-store` or `broker`) without recording secret values.
 
-`/metrics` also exports bounded build revision, service version, deployment mode, aggregate adapter mode, `expected_active`, explicit `nutsnews_worker_health_probe` liveness/startup/readiness state, distinct scheduler-loop active/fresh states, the last successful scheduling-cycle timestamp, and a fixed-bucket `nutsnews_worker_scheduler_cycle_duration_seconds` histogram. Probe series begin with truthful pre-start values and refresh after scheduling cycles as the service starts, becomes ready, becomes stale, and stops. Health evaluation events remain in structured logs, while the shared runtime's overlapping `nutsnews_worker_health` family is suppressed on the metrics branch so `nutsnews_worker_health_probe` is the sole probe family. Duration-less dependency events likewise remain available to structured logs but are not forwarded to the legacy runtime metric adapter as fabricated zero-latency observations; measured `runtime.dependency.observed` events are the only dependency-latency path. Shadow deployments export `expected_active=0`, allowing production ownership alerts to ignore them without changing readiness. When metrics are disabled, `/metrics` is intentionally empty.
+`/metrics` also exports bounded build revision, service version, deployment mode, aggregate adapter mode, `expected_active`, explicit `nutsnews_worker_health_probe` liveness/startup/readiness state, bounded `nutsnews_worker_health_check` dependency state, distinct scheduler-loop active/fresh states, the last successful scheduling-cycle timestamp, and a fixed-bucket `nutsnews_worker_scheduler_cycle_duration_seconds` histogram. Runtime 1.0 owns build, deployment, ownership, last-success, health, and dependency-latency families; the scheduler adds only loop and cycle metrics. Probe series begin with truthful pre-start values and refresh after scheduling cycles as the service starts, becomes ready, becomes stale, and stops. Duration-less dependency events remain available to structured logs, and Runtime 1.0 records dependency histograms only when a measured duration exists. Shadow deployments export `expected_active=0`, allowing production ownership alerts to ignore them without changing readiness. When metrics are disabled, `/metrics` is intentionally empty.
 
 The container publishing workflow injects the immutable Git SHA into `NUTSNEWS_SCHEDULER_BUILD_REVISION` as well as the OCI revision label. A local test-mode image built without a revision remains explicitly `unknown`; production dependency mode rejects that sentinel.
 

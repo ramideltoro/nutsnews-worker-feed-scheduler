@@ -6,11 +6,11 @@ The feed scheduler owns the first worker-uplift service boundary. It leases due 
 
 ## Runtime Surfaces
 
-- Contracts: `@ramideltoro/nutsnews-worker-contracts@0.3.1`
-- Runtime: `@ramideltoro/nutsnews-worker-runtime@0.4.0`
+- Contracts: `@ramideltoro/nutsnews-worker-contracts@1.0.0`
+- Runtime: `@ramideltoro/nutsnews-worker-runtime@1.0.0`
 - Route boundary: `getWorkerRoute("fetch")`
 - Health: separate liveness, startup, and readiness probes
-- Metrics: bounded Prometheus text from the shared runtime sink plus service-owned build, mode, loop, expected-activity, last-success, and explicit liveness/startup/readiness signals
+- Metrics: Runtime 1.0 owns bounded build, mode, expected-activity, last-success, dependency, and probe/check families; the service adds only scheduler-loop and cycle-duration signals
 - Shutdown: stop accepting work, wait for in-flight operations, close broker lifecycle
 - Production adapters: backend Worker DB API feed reader, scheduler-schema PostgreSQL lease store, a publisher-only RabbitMQ adapter built on the shared runtime broker contract, and the system clock
 
@@ -40,7 +40,7 @@ GitHub Actions starts PostgreSQL and RabbitMQ service containers for CI, so conc
 
 Failure telemetry includes the feed, window, attempt count when available, idempotency key for lease-store failures, and the dependency label. It does not include connection strings, tokens, URLs from secret configuration, or message bodies.
 
-Telemetry sinks are wrapped independently as best-effort observers before they reach the broker, health probes, or scheduling loop. A rejection from one sink does not starve the other configured sinks and cannot abort publication, strand an acquired lease, or change a confirmed lease to failed; regression coverage rejects both telemetry and metric operations while verifying scheduling and lifecycle state. Health evaluation events remain in logs but are excluded from the legacy runtime metric adapter, leaving the seeded service-owned `nutsnews_worker_health_probe` family as the single health metric contract. Duration-less dependency events are also excluded instead of becoming synthetic zero-millisecond latency; measured `runtime.dependency.observed` events are the sole dependency-latency path.
+Telemetry sinks are wrapped independently as best-effort observers before they reach the broker, health probes, or scheduling loop. A rejection from one sink does not starve the other configured sinks and cannot abort publication, strand an acquired lease, or change a confirmed lease to failed; regression coverage rejects both telemetry and metric operations while verifying scheduling and lifecycle state. Health evaluation events reach both structured logs and Runtime 1.0's canonical `nutsnews_worker_health_probe` and `nutsnews_worker_health_check` families. Runtime 1.0 ignores duration-less dependency observations instead of fabricating zero-millisecond latency; measured `runtime.dependency.observed` events are the sole dependency-histogram path.
 
 The deterministic shadow smoke command uses fixture feeds and local doubles:
 

@@ -41,7 +41,10 @@ describe("scheduler HTTP endpoints", () => {
         service: config.serviceName,
         version: config.serviceVersion,
         environment: config.environment,
-        host: config.host
+        host: config.host,
+        revision: config.buildRevision,
+        deployment: "shadow",
+        adapter: "in_memory"
       }
     });
     const service = createSchedulerService({
@@ -67,9 +70,18 @@ describe("scheduler HTTP endpoints", () => {
     expect(metricsResponse.status).toBe(200);
     const metricsBody = await metricsResponse.text();
     expect(metricsBody).toContain("nutsnews_worker_build_info");
+    expect(metricsBody).toContain('version="0.1.0",revision="unknown"');
+    expect(metricsBody).toContain('deployment="shadow",adapter="in_memory"');
     expect(metricsBody).toContain("nutsnews_worker_expected_active");
     expect(metricsBody).toContain("nutsnews_worker_last_success_timestamp_seconds");
     expect(metricsBody.match(/^# TYPE nutsnews_worker_health_probe gauge$/gmu)).toHaveLength(1);
+    expect(metricsBody.match(/^# TYPE nutsnews_worker_health_check gauge$/gmu)).toHaveLength(1);
+    expect(metricsBody).toMatch(
+      /nutsnews_worker_health_probe\{(?=[^\n}]*probe="readiness")(?=[^\n}]*outcome="ok")[^\n}]*\} 1/u
+    );
+    expect(metricsBody).toMatch(
+      /nutsnews_worker_last_success_timestamp_seconds\{[^\n}]*\} [1-9][0-9]*/u
+    );
     expect(metricsBody).not.toMatch(/^# TYPE nutsnews_worker_health gauge$/mu);
     expect(metricsBody).not.toMatch(/^nutsnews_worker_health\{/mu);
 

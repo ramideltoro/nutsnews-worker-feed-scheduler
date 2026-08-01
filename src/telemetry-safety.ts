@@ -1,16 +1,10 @@
 import type {
   PrometheusRuntimeTelemetrySink,
-  RuntimeTelemetryEvent,
   RuntimeTelemetryFlusher,
   RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
-export interface SchedulerOperationalMetricControls {
-  setExpectedActive?(expected: boolean): void;
-  setLastSuccessTimestamp?(timestampSeconds: number): void;
-}
-
-export type SchedulerMetricsSink = Omit<PrometheusRuntimeTelemetrySink, "recordDependencyLatency"> & SchedulerOperationalMetricControls;
+export type SchedulerMetricsSink = PrometheusRuntimeTelemetrySink;
 
 export function bestEffortTelemetrySink(
   sink: RuntimeTelemetrySink | undefined
@@ -82,22 +76,9 @@ export function bestEffortSchedulerMetricsSink(
     return undefined;
   }
 
-  const controls: SchedulerOperationalMetricControls = {
-    ...(typeof sink.setExpectedActive === "function" ? {
-      setExpectedActive: (expected: boolean): void => {
-        safely(() => sink.setExpectedActive?.(expected));
-      }
-    } : {}),
-    ...(typeof sink.setLastSuccessTimestamp === "function" ? {
-      setLastSuccessTimestamp: (timestampSeconds: number): void => {
-        safely(() => sink.setLastSuccessTimestamp?.(timestampSeconds));
-      }
-    } : {})
-  };
-
   return {
     allowedLabels: sink.allowedLabels,
-    emit: async (event: RuntimeTelemetryEvent): Promise<void> => {
+    emit: async (event): Promise<void> => {
       try {
         await sink.emit(event);
       } catch {
@@ -117,40 +98,13 @@ export function bestEffortSchedulerMetricsSink(
     setShutdownDraining: (draining): void => {
       safely(() => sink.setShutdownDraining(draining));
     },
-    ...controls
-  };
-}
-
-export function schedulerMetricsTelemetrySink(
-  sink: RuntimeTelemetrySink | undefined
-): RuntimeTelemetrySink | undefined {
-  if (sink === undefined) {
-    return undefined;
-  }
-
-  return {
-    emit: async (event) => {
-      if (event.name === "runtime.health.evaluated") {
-        return;
-      }
-
-      if (event.name === "runtime.dependency.observed" && measuredDuration(event) === undefined) {
-        return;
-      }
-
-      await sink.emit(event);
+    setExpectedActive: (expected): void => {
+      safely(() => sink.setExpectedActive(expected));
+    },
+    setLastSuccessTimestamp: (timestampSeconds): void => {
+      safely(() => sink.setLastSuccessTimestamp(timestampSeconds));
     }
   };
-}
-
-function measuredDuration(event: RuntimeTelemetryEvent): number | undefined {
-  if (event.durationMs !== undefined && Number.isFinite(event.durationMs)) {
-    return event.durationMs;
-  }
-
-  const durationMs = event.attributes?.durationMs;
-
-  return typeof durationMs === "number" && Number.isFinite(durationMs) ? durationMs : undefined;
 }
 
 function safely(operation: () => void): void {

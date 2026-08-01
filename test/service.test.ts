@@ -10,7 +10,10 @@ import {
   vi
 } from "vitest";
 
-import { loadSchedulerConfig } from "../src/config.js";
+import {
+  loadSchedulerConfig,
+  type SchedulerConfig
+} from "../src/config.js";
 import type { SchedulerDependencies } from "../src/dependencies.js";
 import type { ScheduleLeaseStore } from "../src/lease-store.js";
 import { createSchedulerLoop } from "../src/loop.js";
@@ -25,28 +28,58 @@ describe("createSchedulerService", () => {
     const config = loadSchedulerConfig({
       NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
     });
+    const metrics = createPrometheusRuntimeTelemetrySink({
+      identity: {
+        service: config.serviceName,
+        version: config.serviceVersion,
+        environment: config.environment,
+        host: config.host
+      }
+    });
     const service = createSchedulerService({
       config,
-      dependencies: createLocalSchedulerDependencies()
+      dependencies: createLocalSchedulerDependencies(),
+      metrics
     });
-    const initial = service.collectOperationalMetrics();
+    const initial = `${metrics.collect()}${service.collectOperationalMetrics()}`;
 
-    expect(initial).toContain('nutsnews_worker_health_probe{environment="local",service="nutsnews-worker-feed-scheduler",probe="liveness",outcome="ok"} 1');
-    expect(initial).toContain('nutsnews_worker_health_probe{environment="local",service="nutsnews-worker-feed-scheduler",probe="startup",outcome="unhealthy"} 1');
-    expect(initial).toContain('nutsnews_worker_health_probe{environment="local",service="nutsnews-worker-feed-scheduler",probe="readiness",outcome="unhealthy"} 1');
+    expect(metricValue(initial, "nutsnews_worker_health_probe", {
+      probe: "liveness",
+      outcome: "ok"
+    })).toBe(1);
+    expect(metricValue(initial, "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "unhealthy"
+    })).toBe(1);
+    expect(metricValue(initial, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    })).toBe(1);
     expect(initial.match(/^# TYPE nutsnews_worker_health_probe gauge$/gmu)).toHaveLength(1);
     expect(initial).not.toMatch(/^# TYPE nutsnews_worker_health gauge$/mu);
 
     await service.start();
-    expect(service.collectOperationalMetrics()).toContain('probe="startup",outcome="ok"} 1');
+    expect(metricValue(metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "ok"
+    })).toBe(1);
 
     await service.startScheduling();
-    expect(service.collectOperationalMetrics()).toContain('probe="readiness",outcome="ok"} 1');
+    expect(metricValue(metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "ok"
+    })).toBe(1);
 
     await service.stop();
-    const stopped = service.collectOperationalMetrics();
-    expect(stopped).toContain('probe="startup",outcome="unhealthy"} 1');
-    expect(stopped).toContain('probe="readiness",outcome="unhealthy"} 1');
+    const stopped = metrics.collect();
+    expect(metricValue(stopped, "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "unhealthy"
+    })).toBe(1);
+    expect(metricValue(stopped, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    })).toBe(1);
   });
 
   it("starts, becomes ready, records a dry scheduler check, and drains cleanly", async () => {
@@ -85,9 +118,9 @@ describe("createSchedulerService", () => {
       shadowMode: true
     });
     expect(service.lastSuccessAt).toBeDefined();
-    expect(service.collectOperationalMetrics()).toContain("nutsnews_worker_build_info");
-    expect(service.collectOperationalMetrics()).toContain("nutsnews_worker_expected_active");
-    expect(service.collectOperationalMetrics()).toContain("nutsnews_worker_last_success_timestamp_seconds");
+    expect(metrics.collect()).toContain("nutsnews_worker_build_info");
+    expect(metrics.collect()).toContain("nutsnews_worker_expected_active");
+    expect(metrics.collect()).toContain("nutsnews_worker_last_success_timestamp_seconds");
     expect(service.collectOperationalMetrics()).toContain("nutsnews_worker_scheduler_cycle_duration_seconds_bucket");
     expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_scheduler_cycle_duration_seconds_count\{[^\n]+outcome="success"\} 1/u);
     expect(metrics.collect()).toMatch(/nutsnews_worker_inflight\{[^\n]+\} 0/u);
@@ -220,13 +253,37 @@ describe("createSchedulerService", () => {
       NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent"
     });
     const dependencies = productionCompatibleTestDependencies();
+    const metrics = createIdentityMetrics(config, "shadow", "production");
     const service = createSchedulerService({
       config,
-      dependencies
+      dependencies,
+      metrics
     });
 
     await service.start();
-    expect((await service.health.readiness()).status).toBe("unhealthy");
+    const inactiveReadiness = await service.health.readiness();
+
+    expect(inactiveReadiness.status).toBe("unhealthy");
+    expect(inactiveReadiness.checks.find((check) => check.name === "scheduler-loop")).toMatchObject({
+      status: "unhealthy",
+      details: {
+        reason: "production-scheduling-loop-inactive"
+      }
+    });
+    expect(inactiveReadiness.checks.find((check) => check.name === "production-adapters")).toMatchObject({
+      status: "ok"
+    });
+
+    service.setSchedulingLoopActive?.(true);
+    const neverSucceededReadiness = await service.health.readiness();
+
+    expect(neverSucceededReadiness.status).toBe("unhealthy");
+    expect(neverSucceededReadiness.checks.find((check) => check.name === "scheduler-loop")).toMatchObject({
+      details: {
+        reason: "production-scheduling-loop-never-succeeded"
+      }
+    });
+    service.setSchedulingLoopActive?.(false);
 
     await service.startScheduling();
     const readiness = await service.health.readiness();
@@ -241,7 +298,9 @@ describe("createSchedulerService", () => {
       "scheduler-loop",
       "production-adapters"
     ]);
-    expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_expected_active\{[^\n]+\} 0/u);
+    expect(metricValue(metrics.collect(), "nutsnews_worker_expected_active")).toBe(0);
+    expect(metricValue(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toBeGreaterThan(0);
+    expect(metrics.collect()).toContain('deployment="shadow",adapter="production"');
     expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_scheduler_loop_active\{[^\n]+\} 1/u);
     expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_scheduler_loop_fresh\{[^\n]+\} 1/u);
 
@@ -249,11 +308,17 @@ describe("createSchedulerService", () => {
     expect((await service.health.readiness()).status).toBe("unhealthy");
     expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_scheduler_loop_active\{[^\n]+\} 1/u);
     expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_scheduler_loop_fresh\{[^\n]+\} 0/u);
-    expect(service.collectOperationalMetrics()).toContain('probe="readiness",outcome="unhealthy"} 1');
+    expect(metricValue(metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    })).toBe(1);
 
     await service.runOnce();
     expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_scheduler_loop_fresh\{[^\n]+\} 1/u);
-    expect(service.collectOperationalMetrics()).toContain('probe="readiness",outcome="ok"} 1');
+    expect(metricValue(metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "ok"
+    })).toBe(1);
 
     await service.stop();
     } finally {
@@ -275,9 +340,11 @@ describe("createSchedulerService", () => {
       ...shadowConfig,
       shadowMode: false
     };
+    const metrics = createIdentityMetrics(config, "production", "production");
     const service = createSchedulerService({
       config,
-      dependencies: productionCompatibleTestDependencies()
+      dependencies: productionCompatibleTestDependencies(),
+      metrics
     });
 
     await service.start();
@@ -285,8 +352,8 @@ describe("createSchedulerService", () => {
 
     await service.startScheduling();
     expect((await service.health.readiness()).status).toBe("ok");
-    expect(service.collectOperationalMetrics()).toContain('deployment="production",adapter="production"');
-    expect(service.collectOperationalMetrics()).toMatch(/nutsnews_worker_expected_active\{[^\n]+\} 1/u);
+    expect(metrics.collect()).toContain('deployment="production",adapter="production"');
+    expect(metricValue(metrics.collect(), "nutsnews_worker_expected_active")).toBe(1);
 
     await service.stop();
   });
@@ -419,4 +486,47 @@ function productionIdentityLeaseStore(delegate: ScheduleLeaseStore): ScheduleLea
 
 class ProductionIdentityLocalBroker extends LocalBrokerTransport {
   override readonly name = "rabbitmq-payload-publisher";
+}
+
+function createIdentityMetrics(
+  config: SchedulerConfig,
+  deployment: "shadow" | "production",
+  adapter: "in_memory" | "production"
+): ReturnType<typeof createPrometheusRuntimeTelemetrySink> {
+  return createPrometheusRuntimeTelemetrySink({
+    identity: {
+      service: config.serviceName,
+      version: config.serviceVersion,
+      environment: config.environment,
+      host: config.host,
+      revision: config.buildRevision,
+      deployment,
+      adapter
+    }
+  });
+}
+
+function metricValue(
+  body: string,
+  metric: string,
+  labels: Readonly<Record<string, string>> = {}
+): number {
+  const line = body.split("\n").find((candidate) =>
+    (candidate.startsWith(`${metric}{`) || candidate.startsWith(`${metric} `))
+    && Object.entries(labels).every(([name, value]) =>
+      candidate.includes(`${name}="${value}"`)
+    )
+  );
+
+  if (line === undefined) {
+    throw new Error(`Metric ${metric} with requested labels was not found.`);
+  }
+
+  const value = Number(line.slice(line.lastIndexOf(" ") + 1));
+
+  if (!Number.isFinite(value)) {
+    throw new Error(`Metric ${metric} did not have a finite sample.`);
+  }
+
+  return value;
 }

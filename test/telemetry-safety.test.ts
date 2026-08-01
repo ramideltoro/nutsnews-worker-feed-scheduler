@@ -9,8 +9,8 @@ import {
 } from "vitest";
 
 import {
-  combineBestEffortTelemetrySinks,
-  schedulerMetricsTelemetrySink
+  bestEffortSchedulerMetricsSink,
+  combineBestEffortTelemetrySinks
 } from "../src/telemetry-safety.js";
 
 describe("scheduler telemetry safety", () => {
@@ -36,7 +36,7 @@ describe("scheduler telemetry safety", () => {
     expect(observed).toBe(1);
   });
 
-  it("keeps health evaluation logs while suppressing the shared runtime health metric family", async () => {
+  it("forwards Runtime 1 health events to the canonical probe metric family", async () => {
     const logs = createBufferedRuntimeTelemetrySink();
     const runtimeMetrics = createPrometheusRuntimeTelemetrySink({
       identity: {
@@ -48,7 +48,7 @@ describe("scheduler telemetry safety", () => {
     });
     const telemetry = combineBestEffortTelemetrySinks(
       logs,
-      schedulerMetricsTelemetrySink(runtimeMetrics)
+      bestEffortSchedulerMetricsSink(runtimeMetrics)
     );
 
     await telemetry?.emit({
@@ -64,17 +64,29 @@ describe("scheduler telemetry safety", () => {
 
     expect(logs.events).toHaveLength(1);
     expect(logs.events[0]?.name).toBe("runtime.health.evaluated");
+    expect(runtimeMetrics.collect()).toMatch(
+      /nutsnews_worker_health_probe\{(?=[^\n}]*probe="readiness")(?=[^\n}]*outcome="ok")[^\n}]*\} 1/u
+    );
     expect(runtimeMetrics.collect()).not.toMatch(/^# TYPE nutsnews_worker_health gauge$/mu);
     expect(runtimeMetrics.collect()).not.toMatch(/^nutsnews_worker_health\{/mu);
   });
 
-  it("does not turn duration-less startup observations into zero-latency samples", async () => {
-    let observations = 0;
-    const metrics = schedulerMetricsTelemetrySink({
-      emit: () => {
-        observations += 1;
+  it("relies on Runtime 1 to ignore duration-less dependency observations", async () => {
+    const runtimeMetrics = createPrometheusRuntimeTelemetrySink({
+      identity: {
+        service: "nutsnews-worker-feed-scheduler",
+        version: "0.1.0",
+        environment: "test",
+        host: "scheduler-test"
+      },
+      cardinality: {
+        dependencies: [
+          "scheduler-shell",
+          "feed-source"
+        ]
       }
     });
+    const metrics = bestEffortSchedulerMetricsSink(runtimeMetrics);
 
     await metrics?.emit({
       name: "runtime.dependency.observed",
@@ -96,6 +108,9 @@ describe("scheduler telemetry safety", () => {
       }
     });
 
-    expect(observations).toBe(1);
+    expect(runtimeMetrics.collect()).toMatch(
+      /nutsnews_worker_dependency_duration_seconds_count\{[^\n]+dependency="feed-source"[^\n]*\} 1/u
+    );
+    expect(runtimeMetrics.collect()).not.toContain('dependency="scheduler-shell"');
   });
 });

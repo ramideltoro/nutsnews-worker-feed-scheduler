@@ -43,11 +43,11 @@ Some GitHub package access controls can be applied only after the first package 
 
 This repository currently owns the deployable shell for the scheduler stage:
 
-- exact package pins to `@ramideltoro/nutsnews-worker-contracts@0.3.1` and `@ramideltoro/nutsnews-worker-runtime@0.4.0`;
+- exact package pins to `@ramideltoro/nutsnews-worker-contracts@1.0.0` and `@ramideltoro/nutsnews-worker-runtime@1.0.0`;
 - liveness, startup, readiness, metrics, and value-free config-schema endpoints;
 - graceful shutdown using the shared runtime drain controller;
 - backend API feed source, durable scheduler-schema PostgreSQL leases, RabbitMQ publisher confirms, and a wall-clock freshness check in production mode;
 - local broker, manual clock, feed-source, and in-memory lease doubles for explicit test mode only;
 - shadow-mode enforcement so this service cannot cut over legacy ingestion by configuration alone.
 - due-feed scheduling decisions, idempotent schedule-window leases, contract-valid fetch-work publication, and publisher-confirm finalization.
-- an active non-overlapping scheduling loop, production-adapter and loop-freshness readiness gates, and bounded build/mode/expected-active/last-success metrics; expected-active controls paging ownership, not readiness.
+- an active non-overlapping scheduling loop, production-adapter and loop-freshness readiness gates, Runtime 1.0 bounded build/mode/expected-active/last-success/health metrics, and scheduler-owned loop/cycle metrics; expected-active controls paging ownership, not readiness.

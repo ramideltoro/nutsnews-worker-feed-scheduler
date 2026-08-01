@@ -5,7 +5,8 @@ import {
   createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
-  SYSTEM_RUNTIME_CLOCK
+  SYSTEM_RUNTIME_CLOCK,
+  type RuntimeServiceIdentity
 } from "@ramideltoro/nutsnews-worker-runtime";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
 
@@ -25,9 +26,7 @@ import {
 import { createSchedulerService } from "./service.js";
 import {
   bestEffortSchedulerMetricsSink,
-  bestEffortTelemetryFlusher,
-  combineBestEffortTelemetrySinks,
-  schedulerMetricsTelemetrySink
+  bestEffortTelemetryFlusher
 } from "./telemetry-safety.js";
 import { createLocalSchedulerDependencies } from "./test-doubles.js";
 
@@ -119,7 +118,7 @@ export function createSchedulerApplication(
   dependencyOverride?: SchedulerDependencies
 ): SchedulerApplication {
   const dependencies = dependencyOverride ?? createSchedulerDependencies(config);
-  const identity = {
+  const identity: RuntimeServiceIdentity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
@@ -162,7 +161,7 @@ export function createSchedulerApplication(
   const metrics = bestEffortSchedulerMetricsSink(config.metricsEnabled
     ? createPrometheusRuntimeTelemetrySink(metricsOptions)
     : undefined);
-  const telemetry = combineBestEffortTelemetrySinks(logSink, schedulerMetricsTelemetrySink(metrics));
+  const telemetry = logSink;
   const reconciliationToken = reconciliationTokenFromEnv();
   const service = createSchedulerService({
     config,
@@ -281,13 +280,20 @@ function assertPackageCompatibility(): void {
   const runtime = getRuntimePackageMetadata();
   const contractsVersion: string = contracts.packageVersion;
   const runtimeVersion: string = runtime.packageVersion;
+  const runtimeContractsVersion: string = runtime.contractsPackageVersion;
 
-  if (contractsVersion !== "0.3.1") {
+  if (contractsVersion !== "1.0.0") {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 
-  if (runtimeVersion !== "0.4.0") {
+  if (runtimeVersion !== "1.0.0") {
     throw new Error(`Unsupported runtime package version ${runtimeVersion}.`);
+  }
+
+  if (runtimeContractsVersion !== contractsVersion) {
+    throw new Error(
+      `Runtime contracts version ${runtimeContractsVersion} does not match installed contracts ${contractsVersion}.`
+    );
   }
 }
 
