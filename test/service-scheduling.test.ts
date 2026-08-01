@@ -254,12 +254,16 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
   const clock = new ManualSchedulerClock("2026-07-23T00:05:42.000Z");
   const broker = new LocalBrokerTransport();
   const dependencies: SchedulerDependencies = {
+    mode: "test",
+    clockKind: "manual-test",
+    brokerKind: "local-test",
     clock,
     feedSource: createLocalFeedSource({
       feeds
     }),
     leaseStore,
-    brokerTransport: broker
+    brokerTransport: broker,
+    brokerProbe: broker
   };
   const telemetry = createBufferedRuntimeTelemetrySink();
   const service = createSchedulerService({
@@ -279,6 +283,16 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
 }
 
 class FailingLeaseStore implements ScheduleLeaseStore {
+  readonly name = "failing-test-lease-store";
+  readonly adapterKind = "in-memory-test" as const;
+
+  probe(): Promise<{ readonly status: "unhealthy"; readonly summary: string }> {
+    return Promise.resolve({
+      status: "unhealthy",
+      summary: "test lease store unavailable"
+    });
+  }
+
   acquire(_command: ScheduleLeaseAcquireCommand): Promise<never> {
     void _command;
     const error = new Error("database unavailable");
@@ -296,6 +310,10 @@ class FailingLeaseStore implements ScheduleLeaseStore {
 
   get(): Promise<undefined> {
     return Promise.resolve(undefined);
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

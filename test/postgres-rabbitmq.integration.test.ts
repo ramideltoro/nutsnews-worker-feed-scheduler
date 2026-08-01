@@ -33,6 +33,8 @@ import type {
   ScheduleLeaseRecord,
   ScheduleLeaseStore
 } from "../src/lease-store.js";
+import { PostgresScheduleLeaseStore } from "../src/production-dependencies.js";
+import { SchedulerRabbitMqPublisherTransport } from "../src/rabbitmq-publisher.js";
 import { createSchedulerService } from "../src/service.js";
 import type { SchedulerFeedDefinition } from "../src/scheduling.js";
 import {
@@ -53,24 +55,29 @@ describeWithServices("PostgreSQL and RabbitMQ scheduler integration", () => {
       connectionString: postgresUrl,
       max: 4
     });
+    await pool.query("CREATE SCHEMA IF NOT EXISTS worker_uplift_scheduler");
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS scheduler_test_leases (
-        idempotency_key text PRIMARY KEY,
-        token text NOT NULL,
-        feed_id text NOT NULL,
-        window_start timestamptz NOT NULL,
-        window_end timestamptz NOT NULL,
-        status text NOT NULL,
+      CREATE TABLE IF NOT EXISTS worker_uplift_scheduler.feed_leases (
+        id bigserial PRIMARY KEY,
+        feed_url text NOT NULL,
+        lease_token text NOT NULL,
+        holder_stage_execution_id text NOT NULL,
+        lease_version integer NOT NULL CHECK (lease_version > 0),
         acquired_at timestamptz NOT NULL,
-        lease_expires_at timestamptz NOT NULL,
-        attempt_count integer NOT NULL,
-        confirmed_at timestamptz,
-        failed_at timestamptz,
-        failure_reason text,
-        publish_receipt_message_id text
+        expires_at timestamptz NOT NULL,
+        released_at timestamptz,
+        diagnostic_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+        redact_after timestamptz NOT NULL DEFAULT (now() + interval '30 days'),
+        UNIQUE (feed_url, lease_version),
+        UNIQUE (lease_token)
       )
     `);
-    await pool.query("TRUNCATE scheduler_test_leases");
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS worker_uplift_scheduler_active_feed_lease_uidx
+      ON worker_uplift_scheduler.feed_leases (feed_url)
+      WHERE released_at IS NULL
+    `);
+    await pool.query("TRUNCATE worker_uplift_scheduler.feed_leases");
   });
 
   afterEach(async () => {
@@ -136,14 +143,18 @@ describeWithServices("PostgreSQL and RabbitMQ scheduler integration", () => {
       NUTSNEWS_SCHEDULER_CONCURRENCY: "4"
     });
     const dependencies: SchedulerDependencies = {
+      mode: "test",
+      clockKind: "manual-test",
+      brokerKind: "local-test",
       clock: new ManualSchedulerClock("2026-07-23T00:05:42.000Z"),
       feedSource: createLocalFeedSource({
         feeds: [
           feed
         ]
       }),
-      leaseStore: new PostgresTestLeaseStore(pool),
-      brokerTransport
+      leaseStore: new PostgresScheduleLeaseStore(postgresUrl ?? ""),
+      brokerTransport,
+      brokerProbe: brokerTransport
     };
 
     return {
@@ -156,8 +167,18 @@ describeWithServices("PostgreSQL and RabbitMQ scheduler integration", () => {
   }
 });
 
-class PostgresTestLeaseStore implements ScheduleLeaseStore {
+export class PostgresTestLeaseStore implements ScheduleLeaseStore {
+  readonly name = "postgres-test-lease-store";
+  readonly adapterKind = "postgres" as const;
+
   constructor(private readonly pool: Pool) {}
+
+  probe(): Promise<{ readonly status: "ok"; readonly summary: string }> {
+    return Promise.resolve({
+      status: "ok",
+      summary: "PostgreSQL test lease store ready"
+    });
+  }
 
   async acquire(command: ScheduleLeaseAcquireCommand): Promise<ScheduleLeaseAcquireResult> {
     const client = await this.pool.connect();
@@ -307,6 +328,10 @@ class PostgresTestLeaseStore implements ScheduleLeaseStore {
 
     return row === undefined ? undefined : rowToRecord(row);
   }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
 }
 
 interface DbLeaseRow {
@@ -366,19 +391,28 @@ function rowToRecord(row: DbLeaseRow): ScheduleLeaseRecord {
 
 class RabbitMqTestTransport implements RuntimeBrokerTransport {
   readonly name = "rabbitmq-test-transport";
-  private connection: ChannelModel | undefined;
-  private channel: ConfirmChannel | undefined;
+  private adminConnection: ChannelModel | undefined;
+  private adminChannel: ConfirmChannel | undefined;
+  private publisher: SchedulerRabbitMqPublisherTransport | undefined;
   private route = getWorkerRoute("fetch");
 
   constructor(private readonly url: string | undefined) {}
+
+  async probe() {
+    return this.requirePublisher().probe();
+  }
 
   async connect(): Promise<void> {
     if (this.url === undefined) {
       throw new Error("RabbitMQ URL is required");
     }
 
-    this.connection = await amqp.connect(this.url);
-    this.channel = await this.connection.createConfirmChannel();
+    this.publisher = new SchedulerRabbitMqPublisherTransport({
+      url: this.url
+    });
+    this.adminConnection = await amqp.connect(this.url);
+    this.adminChannel = await this.adminConnection.createConfirmChannel();
+    await this.publisher.connect();
   }
 
   async assertTopology(routes: readonly WorkerRoute[]): Promise<void> {
@@ -398,31 +432,7 @@ class RabbitMqTestTransport implements RuntimeBrokerTransport {
   }
 
   publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
-    const channel = this.requireChannel();
-    const route = getWorkerRoute(command.envelope.route);
-    const body = Buffer.from(JSON.stringify(command));
-
-    return new Promise((resolve, reject) => {
-      channel.publish(route.exchange, route.routingKey, body, {
-        contentType: "application/json",
-        persistent: true,
-        mandatory: true
-      }, (error) => {
-        if (error !== null) {
-          reject(error instanceof Error ? error : new Error("RabbitMQ publish confirm failed."));
-          return;
-        }
-
-        resolve({
-          messageId: command.envelope.messageId,
-          stage: command.envelope.route,
-          exchange: route.exchange,
-          routingKey: route.routingKey,
-          confirmed: true,
-          confirmedAt: command.envelope.occurredAt
-        });
-      });
-    });
+    return this.requirePublisher().publish(command);
   }
 
   consume(stage: WorkerStage, handler: BrokerDeliveryHandler): Promise<never> {
@@ -432,15 +442,21 @@ class RabbitMqTestTransport implements RuntimeBrokerTransport {
   }
 
   drain(): Promise<void> {
-    return Promise.resolve();
+    return this.requirePublisher().drain();
   }
 
   async close(): Promise<void> {
-    const channel = this.channel;
-    const connection = this.connection;
+    const channel = this.adminChannel;
+    const connection = this.adminConnection;
+    const publisher = this.publisher;
 
-    this.channel = undefined;
-    this.connection = undefined;
+    this.adminChannel = undefined;
+    this.adminConnection = undefined;
+    this.publisher = undefined;
+
+    if (publisher !== undefined) {
+      await publisher.close();
+    }
 
     if (channel !== undefined) {
       await closeRabbitMqResource(() => channel.close());
@@ -457,11 +473,19 @@ class RabbitMqTestTransport implements RuntimeBrokerTransport {
   }
 
   private requireChannel(): ConfirmChannel {
-    if (this.channel === undefined) {
+    if (this.adminChannel === undefined) {
       throw new Error("RabbitMQ channel is not connected");
     }
 
-    return this.channel;
+    return this.adminChannel;
+  }
+
+  private requirePublisher(): SchedulerRabbitMqPublisherTransport {
+    if (this.publisher === undefined) {
+      throw new Error("RabbitMQ publisher is not connected");
+    }
+
+    return this.publisher;
   }
 }
 

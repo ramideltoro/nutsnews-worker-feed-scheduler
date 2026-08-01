@@ -51,6 +51,7 @@ export function createLocalFeedSource(options: LocalFeedSourceOptions = {}): Sch
 
   return {
     name: "local-feed-source",
+    adapterKind: "local-test",
     probe: () => ({
       status,
       summary: status === "ok" ? "local test feed source ready" : "local test feed source degraded"
@@ -71,6 +72,15 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
   onPublishStart: (() => void) | undefined;
   private connected = false;
   private closed = false;
+
+  probe(): Promise<SchedulerDependencyProbe> {
+    return Promise.resolve({
+      status: this.connected && !this.closed ? "ok" : "unhealthy",
+      summary: this.connected && !this.closed
+        ? "local test broker ready"
+        : "local test broker unavailable"
+    });
+  }
 
   connect(): Promise<void> {
     this.connected = true;
@@ -137,11 +147,17 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
 }
 
 export function createLocalSchedulerDependencies(options: LocalFeedSourceOptions = {}): SchedulerDependencies {
+  const brokerTransport = new LocalBrokerTransport();
+
   return {
+    mode: "test",
+    clockKind: "manual-test",
+    brokerKind: "local-test",
     clock: new ManualSchedulerClock(),
     feedSource: createLocalFeedSource(options),
     leaseStore: new InMemoryScheduleLeaseStore(),
-    brokerTransport: new LocalBrokerTransport()
+    brokerTransport,
+    brokerProbe: brokerTransport
   };
 }
 

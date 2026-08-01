@@ -15,11 +15,14 @@ import {
   type SchedulerConfig
 } from "./config.js";
 import { createSchedulerHttpServer } from "./http.js";
+import { createSchedulerLoop } from "./loop.js";
+import {
+  createSchedulerDependencies
+} from "./production-dependencies.js";
 import {
   createSchedulerFailClosedReconciler
 } from "./reconciliation.js";
 import { createSchedulerService } from "./service.js";
-import { createLocalSchedulerDependencies } from "./test-doubles.js";
 
 export {
   SCHEDULER_CONFIG_SCHEMA,
@@ -35,6 +38,24 @@ export type {
 export {
   createSchedulerHttpServer
 } from "./http.js";
+export {
+  createSchedulerLoop,
+  type SchedulerLoop,
+  type SchedulerLoopOptions
+} from "./loop.js";
+export {
+  BackendApiFeedSource,
+  PostgresScheduleLeaseStore,
+  SchedulerDependencyError,
+  createProductionSchedulerDependencies,
+  createSchedulerDependencies,
+  type BackendApiFeedSourceOptions,
+  type ProductionSchedulerEnvironment
+} from "./production-dependencies.js";
+export {
+  SchedulerRabbitMqPublisherTransport,
+  type SchedulerRabbitMqPublisherOptions
+} from "./rabbitmq-publisher.js";
 export {
   SCHEDULER_RECONCILIATION_CONFIRMATION,
   SCHEDULER_RECONCILIATION_PATH,
@@ -105,7 +126,7 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createLocalSchedulerDependencies();
+  const dependencies = createSchedulerDependencies(config);
   const reconciliationToken = reconciliationTokenFromEnv();
   const service = createSchedulerService({
     config,
@@ -128,10 +149,26 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
       metrics
     })
   });
+  const schedulerLoop = createSchedulerLoop({
+    service,
+    cadenceMs: config.cadenceMs,
+    onError: (error) => {
+      console.error(JSON.stringify({
+        event: "scheduler.run.failed",
+        errorClass: error instanceof Error && error.name.length > 0
+          ? error.name
+          : "UnknownError",
+        safeMetadataOnly: true
+      }));
+    }
+  });
   const shutdown = createRuntimeShutdownController({
     callbacks: [
       async () => {
         await httpServer.close();
+      },
+      async () => {
+        await schedulerLoop.stop();
       },
       async () => {
         await service.stop();
@@ -153,6 +190,7 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
       assertPackageCompatibility();
       await service.start();
       await httpServer.listen();
+      schedulerLoop.start();
       shutdown.start();
     },
     async stop(): Promise<void> {

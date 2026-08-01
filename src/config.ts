@@ -112,6 +112,10 @@ export function loadSchedulerConfig(env: NodeJS.ProcessEnv = process.env): Sched
     issues.push("NUTSNEWS_SCHEDULER_SHADOW_MODE must remain true until backend-owned deployment enables cutover.");
   }
 
+  if (config.environment.toLowerCase() === "production" && config.dependencyMode !== "production") {
+    issues.push("NUTSNEWS_SCHEDULER_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production.");
+  }
+
   if (issues.length > 0) {
     throw new SchedulerConfigError(issues);
   }
