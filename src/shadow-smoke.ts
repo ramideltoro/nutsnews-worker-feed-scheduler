@@ -23,12 +23,16 @@ async function main(): Promise<void> {
   const service = createSchedulerService({
     config,
     dependencies: {
+      mode: "test",
+      clockKind: "manual-test",
+      brokerKind: "local-test",
       clock: new ManualSchedulerClock(SCHEDULER_FIXTURE_NOW),
       feedSource: createLocalFeedSource({
         feeds: SCHEDULER_FIXTURE_FEEDS
       }),
       leaseStore: new InMemoryScheduleLeaseStore(),
-      brokerTransport
+      brokerTransport,
+      brokerProbe: brokerTransport
     },
     telemetry
   });

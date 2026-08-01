@@ -14,10 +14,12 @@ import {
   createRuntimeInFlightDrainController,
   emitRuntimeTelemetry,
   runtimeNow,
+  SYSTEM_RUNTIME_CLOCK,
   type BrokerLifecycle,
   type PrometheusRuntimeTelemetrySink,
   type RuntimeHealthCheck,
   type RuntimeHealthProbeSet,
+  type RuntimeClock,
   type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
@@ -63,6 +65,7 @@ export interface SchedulerService {
 }
 
 export function createSchedulerService(options: SchedulerServiceOptions): SchedulerService {
+  assertSchedulerDependencyBoundary(options.config, options.dependencies);
   const fetchRoute = getWorkerRoute("fetch");
   const idFactory = options.idFactory ?? createCryptoSchedulerIdFactory();
   const broker = createBrokerLifecycle({
@@ -94,7 +97,10 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         ],
         readinessChecks: [
           brokerReadinessCheck(broker),
+          brokerDependencyReadinessCheck(options.dependencies),
           feedSourceReadinessCheck(options.dependencies),
+          leaseStoreReadinessCheck(options.dependencies),
+          runtimeClockReadinessCheck(options.config, options.dependencies.clock),
           shadowModeCheck(options.config)
         ],
         clock: options.dependencies.clock,
@@ -112,6 +118,17 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
     async start(): Promise<void> {
       if (started) {
         return;
+      }
+
+      if (options.config.dependencyMode === "production") {
+        const dependencyProbes = await Promise.all([
+          options.dependencies.feedSource.probe(),
+          options.dependencies.leaseStore.probe()
+        ]);
+
+        if (dependencyProbes.some((probe) => probe.status !== "ok")) {
+          throw new Error("Production scheduler dependencies failed the startup probe.");
+        }
       }
 
       await broker.start();
@@ -136,10 +153,11 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         const checkedAt = runtimeNow(options.dependencies.clock);
         const now = options.dependencies.clock.now();
         const feeds = await options.dependencies.feedSource.listActiveFeeds(now);
-        const selection = selectDueFeeds(feeds, now, options.config.concurrency);
+        const selection = selectDueFeeds(feeds, now, feeds.length);
         let scheduledCount = 0;
         let confirmedCount = 0;
         let failedCount = 0;
+        let attemptedCount = 0;
 
         for (const decision of selection.skipped) {
           await emitRuntimeTelemetry(options.telemetry, {
@@ -159,9 +177,14 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
         }
 
         for (const decision of selection.due) {
+          if (attemptedCount >= options.config.concurrency) {
+            break;
+          }
+
           const leaseResult = await acquireScheduleLease(options, decision, now, checkedAt, fetchRoute.mainQueue.name);
 
           if (leaseResult === undefined) {
+            attemptedCount += 1;
             failedCount += 1;
             continue;
           }
@@ -184,6 +207,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
             continue;
           }
 
+          attemptedCount += 1;
           scheduledCount += 1;
           await emitRuntimeTelemetry(options.telemetry, {
             name: "runtime.dependency.observed",
@@ -289,6 +313,7 @@ export function createSchedulerService(options: SchedulerServiceOptions): Schedu
       options.metrics?.setShutdownDraining(true);
       await drain.waitForDrain(options.config.shutdownTimeoutMs);
       await broker.stop("shutdown");
+      await options.dependencies.leaseStore.close();
       options.metrics?.setShutdownDraining(false);
       started = false;
     }
@@ -479,6 +504,103 @@ function feedSourceReadinessCheck(dependencies: SchedulerDependencies): RuntimeH
       };
     }
   };
+}
+
+function brokerDependencyReadinessCheck(dependencies: SchedulerDependencies): RuntimeHealthCheck {
+  return {
+    name: "rabbitmq-publisher",
+    critical: true,
+    check: async () => {
+      const probe = await dependencies.brokerProbe.probe();
+
+      return {
+        status: probe.status,
+        details: {
+          source: dependencies.brokerProbe.name,
+          summary: probe.summary
+        }
+      };
+    }
+  };
+}
+
+function leaseStoreReadinessCheck(dependencies: SchedulerDependencies): RuntimeHealthCheck {
+  return {
+    name: "schedule-lease-store",
+    critical: true,
+    check: async () => {
+      const probe = await dependencies.leaseStore.probe();
+
+      return {
+        status: probe.status,
+        details: {
+          source: dependencies.leaseStore.name,
+          summary: probe.summary
+        }
+      };
+    }
+  };
+}
+
+function runtimeClockReadinessCheck(
+  config: SchedulerConfig,
+  clock: RuntimeClock
+): RuntimeHealthCheck {
+  return {
+    name: "runtime-clock",
+    critical: true,
+    check: () => {
+      if (config.dependencyMode !== "production") {
+        return "ok";
+      }
+
+      const skewMs = Math.abs(Date.now() - clock.now().getTime());
+
+      return skewMs <= 5_000
+        ? {
+            status: "ok",
+            details: {
+              source: "system-runtime-clock",
+              freshnessBoundMs: 5_000
+            }
+          }
+        : {
+            status: "unhealthy",
+            details: {
+              source: "system-runtime-clock",
+              reason: "clock-outside-freshness-bound",
+              freshnessBoundMs: 5_000
+            }
+          };
+    }
+  };
+}
+
+function assertSchedulerDependencyBoundary(
+  config: SchedulerConfig,
+  dependencies: SchedulerDependencies
+): void {
+  if (dependencies.mode !== config.dependencyMode) {
+    throw new Error("Scheduler dependency bundle does not match configured dependency mode.");
+  }
+
+  if (config.dependencyMode !== "production") {
+    return;
+  }
+
+  if (
+    dependencies.clockKind !== "system"
+    || dependencies.clock !== SYSTEM_RUNTIME_CLOCK
+    || dependencies.feedSource.adapterKind !== "backend-api"
+    || dependencies.feedSource.name !== "backend-api-feed-source"
+    || dependencies.leaseStore.adapterKind !== "postgres"
+    || dependencies.leaseStore.name !== "postgres-schedule-lease-store"
+    || dependencies.brokerKind !== "rabbitmq"
+    || dependencies.brokerTransport.name !== "rabbitmq-payload-publisher"
+    || dependencies.brokerProbe.name !== "rabbitmq-payload-publisher"
+  ) {
+    throw new Error("Production scheduler dependency boundary rejected a local or unapproved adapter.");
+  }
 }
 
 function shadowModeCheck(config: SchedulerConfig): RuntimeHealthCheck {

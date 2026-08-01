@@ -1,4 +1,5 @@
 import type { SchedulerWindow } from "./scheduling.js";
+import type { SchedulerDependencyProbe } from "./dependencies.js";
 
 export type ScheduleLeaseStatus = "leased" | "confirmed" | "failed";
 export type ScheduleLeaseAcquireStatus = "acquired" | "already_confirmed" | "lease_active";
@@ -37,15 +38,28 @@ export type ScheduleLeaseAcquireResult =
     };
 
 export interface ScheduleLeaseStore {
+  readonly name: string;
+  readonly adapterKind: "in-memory-test" | "postgres";
+  probe(): Promise<SchedulerDependencyProbe>;
   acquire(command: ScheduleLeaseAcquireCommand): Promise<ScheduleLeaseAcquireResult>;
   markConfirmed(token: string, confirmedAt: Date, publishReceiptMessageId: string): Promise<ScheduleLeaseRecord>;
   markFailed(token: string, failedAt: Date, failureReason: string): Promise<ScheduleLeaseRecord>;
   get(idempotencyKey: string): Promise<ScheduleLeaseRecord | undefined>;
+  close(): Promise<void>;
 }
 
 export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
+  readonly name = "in-memory-test-lease-store";
+  readonly adapterKind = "in-memory-test" as const;
   private readonly records = new Map<string, ScheduleLeaseRecord>();
   private tokenCounter = 0;
+
+  probe(): Promise<SchedulerDependencyProbe> {
+    return Promise.resolve({
+      status: "ok",
+      summary: "in-memory test lease store ready"
+    });
+  }
 
   acquire(command: ScheduleLeaseAcquireCommand): Promise<ScheduleLeaseAcquireResult> {
     const existing = this.records.get(command.idempotencyKey);
@@ -112,6 +126,10 @@ export class InMemoryScheduleLeaseStore implements ScheduleLeaseStore {
 
   get(idempotencyKey: string): Promise<ScheduleLeaseRecord | undefined> {
     return Promise.resolve(this.records.get(idempotencyKey));
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
   }
 
   private nextToken(): string {

@@ -49,7 +49,16 @@ Important variables:
 - `NUTSNEWS_SCHEDULER_CONCURRENCY`
 - `NUTSNEWS_SCHEDULER_SHADOW_MODE`
 
-`NUTSNEWS_SCHEDULER_SHADOW_MODE` must remain `true` until backend-owned cutover work explicitly changes the deployment contract.
+`NUTSNEWS_SCHEDULER_SHADOW_MODE` must remain `true` until backend-owned cutover work explicitly changes the deployment contract. A production environment also requires `NUTSNEWS_SCHEDULER_DEPENDENCY_MODE=production`; the service fails configuration if production attempts to select test adapters.
+
+Production mode uses only:
+
+- the system runtime clock;
+- the read-only backend `load-feeds-for-shard` operation;
+- `worker_uplift_scheduler.feed_leases` through the scheduler stage PostgreSQL role; and
+- a publisher-only RabbitMQ adapter built on the shared runtime broker contract through the scheduler identity, with mandatory routing and publisher confirms.
+
+Startup and readiness fail closed unless all three external dependencies are available. Readiness names `backend-api-feed-source`, `postgres-schedule-lease-store`, and `rabbitmq`, and requires the system clock to be within five seconds of wall time. Responses contain status, adapter names, and bounded error classes only—never credentials, feed payloads, URLs, or response bodies.
 
 ## Scheduling Behavior
 
@@ -64,6 +73,8 @@ The scheduler evaluates active feed definitions with an injectable clock:
 - the lease is finalized as `confirmed` only after publisher confirmation;
 - failed publishes mark the lease `failed`, allowing a later retry;
 - already confirmed windows are not published again.
+
+The deployed loop runs once immediately after startup, then waits one configured cadence after each completed run. Runs never overlap. The backend shadow deployment currently bounds each run to one newly acquired feed window; the durable lease prevents repeated publication of the same feed/window across restarts or concurrent replicas.
 
 Published fetch requests validate against `@ramideltoro/nutsnews-worker-contracts@0.3.1`. Schedule-window metadata is carried inside the payload `limits` object while correlation and idempotency live on the worker envelope.
 
@@ -103,7 +114,7 @@ docker build --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-feed-s
 
 `npm run ci` runs linting, strict type checking, unit tests, integration tests, build, CycloneDX SBOM generation, and a production dependency audit.
 
-`npm run smoke:shadow` builds the service and runs a deterministic fixture schedule with local test doubles. It prints a compact JSON summary with shadow-mode status, due feed count, confirmed count, skipped count, published count, and telemetry event count.
+`npm run smoke:shadow` builds the service and runs a deterministic fixture schedule with local test doubles. Test doubles remain selectable only in explicit `test` dependency mode and are rejected when `NUTSNEWS_ENVIRONMENT=production`. The command prints a compact JSON summary with shadow-mode status, due feed count, confirmed count, skipped count, published count, and telemetry event count.
 
 ## Support Boundary
 

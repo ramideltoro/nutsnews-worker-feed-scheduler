@@ -51,4 +51,11 @@ describe("loadSchedulerConfig", () => {
       NUTSNEWS_SCHEDULER_SHADOW_MODE: "false"
     })).toThrow(/SHADOW_MODE/u);
   });
+
+  it("rejects local test dependencies in the production environment", () => {
+    expect(() => loadSchedulerConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "test"
+    })).toThrow(/DEPENDENCY_MODE must be production/u);
+  });
 });
