@@ -50,3 +50,4 @@ This repository currently owns the deployable shell for the scheduler stage:
 - local broker, manual clock, feed-source, and in-memory lease doubles for explicit test mode only;
 - shadow-mode enforcement so this service cannot cut over legacy ingestion by configuration alone.
 - due-feed scheduling decisions, idempotent schedule-window leases, contract-valid fetch-work publication, and publisher-confirm finalization.
+- an active non-overlapping scheduling loop, production-adapter and loop-freshness readiness gates, and bounded build/mode/expected-active/last-success metrics; expected-active controls paging ownership, not readiness.

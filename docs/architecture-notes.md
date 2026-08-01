@@ -10,7 +10,7 @@ The feed scheduler owns the first worker-uplift service boundary. It leases due 
 - Runtime: `@ramideltoro/nutsnews-worker-runtime@0.4.0`
 - Route boundary: `getWorkerRoute("fetch")`
 - Health: separate liveness, startup, and readiness probes
-- Metrics: bounded Prometheus text from the shared runtime sink
+- Metrics: bounded Prometheus text from the shared runtime sink plus service-owned build, mode, loop, expected-activity, last-success, and explicit liveness/startup/readiness signals
 - Shutdown: stop accepting work, wait for in-flight operations, close broker lifecycle
 - Production adapters: backend Worker DB API feed reader, scheduler-schema PostgreSQL lease store, a publisher-only RabbitMQ adapter built on the shared runtime broker contract, and the system clock
 
@@ -26,7 +26,9 @@ The feed scheduler owns the first worker-uplift service boundary. It leases due 
 8. Mark the lease `confirmed` only after the broker returns a publisher-confirm receipt.
 9. Mark failed publishes as retryable failures so the same window can be retried.
 
-Confirmed windows are not republished. Active leases suppress duplicate concurrent scheduling until the lease expires. The deployed loop starts with one immediate bounded run and schedules the next only after the prior run completes plus one configured cadence, so runs cannot overlap.
+The application binds health/metrics and installs shutdown handling before broker initialization and before it launches this flow, so blocked broker startup or a blocked first feed read cannot hide diagnostics. Liveness remains available during initialization while startup and readiness remain unhealthy. It then runs on a recursive cadence and never schedules a second timer until the current iteration settles, preventing overlapping scheduling cycles. Production loop readiness expires after three cadences without a successful cycle.
+
+Confirmed windows are not republished. Active leases suppress duplicate concurrent scheduling until the lease expires. An active or already-confirmed lease does not consume the current cycle's concurrency allowance, so later due feeds can still be considered.
 
 ## Concurrency and Recovery
 
@@ -37,6 +39,8 @@ The local proof suite exercises simultaneous acquire attempts, stale lease recov
 GitHub Actions starts PostgreSQL and RabbitMQ service containers for CI, so concurrent replicas must produce at most one confirmed schedule-window claim and at most one RabbitMQ message for the tested window. Stale leases recover after the configured lease duration when the injected clock advances beyond the lease expiry.
 
 Failure telemetry includes the feed, window, attempt count when available, idempotency key for lease-store failures, and the dependency label. It does not include connection strings, tokens, URLs from secret configuration, or message bodies.
+
+Telemetry sinks are wrapped independently as best-effort observers before they reach the broker, health probes, or scheduling loop. A rejection from one sink does not starve the other configured sinks and cannot abort publication, strand an acquired lease, or change a confirmed lease to failed; regression coverage rejects both telemetry and metric operations while verifying scheduling and lifecycle state. Health evaluation events remain in logs but are excluded from the legacy runtime metric adapter, leaving the seeded service-owned `nutsnews_worker_health_probe` family as the single health metric contract. Duration-less dependency events are also excluded instead of becoming synthetic zero-millisecond latency; measured `runtime.dependency.observed` events are the sole dependency-latency path.
 
 The deterministic shadow smoke command uses fixture feeds and local doubles:
 
@@ -52,6 +56,8 @@ Production database, backend API, RabbitMQ, and telemetry credentials stay outsi
 
 `NUTSNEWS_ENVIRONMENT=production` requires production dependency mode. Production construction uses `SYSTEM_RUNTIME_CLOCK`, `BackendApiFeedSource`, `PostgresScheduleLeaseStore`, and `SchedulerRabbitMqPublisherTransport`; the service boundary rejects manual clocks, local feeds, in-memory leases, and local brokers even if a caller attempts to relabel the bundle.
 
+Production dependency mode also rejects an unknown build revision. Readiness probes the backend feed source, PostgreSQL lease store, RabbitMQ publisher, and system-clock freshness, then requires a recent successful active scheduling cycle and the approved production adapter identities. Configured secrets alone are not proof that the adapters are usable. Shadow deployments export `expected_active=0` for paging ownership without forcing readiness unhealthy, and container health uses liveness rather than ownership state.
+
 ## Local Doubles
 
 The repository includes deterministic local doubles for:
@@ -61,5 +67,6 @@ The repository includes deterministic local doubles for:
 - feed source.
 
 These doubles let tests start the service, expose metrics, and drain cleanly without production dependencies or legacy worker code. They remain available only through explicit test-mode construction and cannot satisfy the production adapter boundary.
+These doubles let local/test mode start, become ready, expose metrics, and drain cleanly without production dependencies or legacy worker code. They remain available only through explicit test-mode construction and cannot satisfy the production adapter boundary.
 
 The in-memory lease store also models confirmed, failed, and active-lease behavior for replay/crash-safety tests.

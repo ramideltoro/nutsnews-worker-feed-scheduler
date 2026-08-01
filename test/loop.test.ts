@@ -65,4 +65,24 @@ describe("scheduler loop", () => {
     resolveRun?.();
     await loop.stop();
   });
+
+  it("keeps running when the loop error observer rejects", async () => {
+    vi.useFakeTimers();
+    const runOnce = vi.fn().mockRejectedValue(new Error("scheduler cycle failed"));
+    const loop = createSchedulerLoop({
+      service: {
+        runOnce
+      } as unknown as SchedulerService,
+      cadenceMs: 60_000,
+      onError: () => Promise.reject(new Error("error observer unavailable"))
+    });
+
+    loop.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runOnce).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runOnce).toHaveBeenCalledTimes(2);
+    await expect(loop.stop()).resolves.toBeUndefined();
+  });
 });

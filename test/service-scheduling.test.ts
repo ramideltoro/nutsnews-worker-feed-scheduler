@@ -3,7 +3,8 @@ import {
   validateStagePayload
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
-  createBufferedRuntimeTelemetrySink
+  createBufferedRuntimeTelemetrySink,
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   describe,
@@ -84,6 +85,75 @@ describe("scheduler publish flow", () => {
     await context.service.stop();
   });
 
+  it("does not let an occupied lease consume the scheduling concurrency allowance", async () => {
+    const context = createServiceContext([
+      dueFeed("feed-occupied", 10),
+      dueFeed("feed-next", 9)
+    ], new FirstFeedAlreadyConfirmedLeaseStore(), undefined, {
+      NUTSNEWS_SCHEDULER_CONCURRENCY: "1"
+    });
+
+    await context.service.start();
+    const result = await context.service.runOnce();
+
+    expect(result).toMatchObject({
+      dueFeedCount: 2,
+      scheduledCount: 1,
+      confirmedCount: 1,
+      failedCount: 0
+    });
+    expect(context.broker.published).toHaveLength(1);
+    expect(context.broker.published[0]?.payload).toMatchObject({
+      feedId: "feed-next"
+    });
+
+    await context.service.stop();
+  });
+
+  it("keeps a confirmed lease confirmed when confirmation telemetry rejects", async () => {
+    let rejectedConfirmationEvents = 0;
+    const telemetry: RuntimeTelemetrySink = {
+      emit: (event) => {
+        if (event.attributes?.event === "scheduler.feed.confirmed") {
+          rejectedConfirmationEvents += 1;
+          return Promise.reject(new Error("telemetry unavailable"));
+        }
+
+        return undefined;
+      }
+    };
+    const context = createServiceContext(undefined, new InMemoryScheduleLeaseStore(), telemetry);
+
+    await context.service.start();
+    const first = await context.service.runOnce();
+    const command = context.broker.published[0];
+
+    if (command === undefined) {
+      throw new Error("expected one published command");
+    }
+
+    expect(first).toMatchObject({
+      scheduledCount: 1,
+      confirmedCount: 1,
+      failedCount: 0
+    });
+    expect(rejectedConfirmationEvents).toBe(1);
+    expect(await context.dependencies.leaseStore.get(command.envelope.idempotencyKey)).toMatchObject({
+      status: "confirmed",
+      attemptCount: 1
+    });
+
+    const second = await context.service.runOnce();
+    expect(second).toMatchObject({
+      scheduledCount: 0,
+      confirmedCount: 0,
+      failedCount: 0
+    });
+    expect(context.broker.published).toHaveLength(1);
+
+    await context.service.stop();
+  });
+
   it("marks a failed publish retryable and confirms on a later retry", async () => {
     const context = createServiceContext();
 
@@ -132,6 +202,15 @@ describe("scheduler publish flow", () => {
       failedCount: 1
     });
     expect(context.telemetry.events.some((event) => event.attributes?.dependency === "broker" && event.attributes.error === "ConfirmTimeoutError")).toBe(true);
+    expect(context.telemetry.events).toContainEqual(expect.objectContaining({
+      name: "runtime.dependency.observed",
+      level: "error",
+      outcome: "failure",
+      attributes: expect.objectContaining({
+        event: "scheduler.run.completed",
+        failedCount: 1
+      }) as Record<string, unknown>
+    }));
 
     await context.service.stop();
   });
@@ -245,11 +324,12 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
       maxItems: 35
     }
   }
-], leaseStore: ScheduleLeaseStore = new InMemoryScheduleLeaseStore()) {
+], leaseStore: ScheduleLeaseStore = new InMemoryScheduleLeaseStore(), telemetrySink?: RuntimeTelemetrySink, configOverrides: NodeJS.ProcessEnv = {}) {
   const config = loadSchedulerConfig({
     NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent",
     NUTSNEWS_SCHEDULER_LEASE_MS: "300000",
-    NUTSNEWS_SCHEDULER_CADENCE_MS: "60000"
+    NUTSNEWS_SCHEDULER_CADENCE_MS: "60000",
+    ...configOverrides
   });
   const clock = new ManualSchedulerClock("2026-07-23T00:05:42.000Z");
   const broker = new LocalBrokerTransport();
@@ -269,7 +349,7 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
   const service = createSchedulerService({
     config,
     dependencies,
-    telemetry,
+    telemetry: telemetrySink ?? telemetry,
     idFactory: new SequenceSchedulerIdFactory(uuids)
   });
 
@@ -280,6 +360,42 @@ function createServiceContext(feeds: readonly SchedulerFeedDefinition[] | undefi
     service,
     telemetry
   };
+}
+
+function dueFeed(feedId: string, priority: number): SchedulerFeedDefinition {
+  return {
+    feedId,
+    feedUrl: `https://feeds.example.test/${feedId}.xml`,
+    enabled: true,
+    cadenceMs: 60_000,
+    priority,
+    shardIndex: 0,
+    shardCount: 2
+  };
+}
+
+class FirstFeedAlreadyConfirmedLeaseStore extends InMemoryScheduleLeaseStore {
+  override acquire(command: ScheduleLeaseAcquireCommand) {
+    if (command.feedId !== "feed-occupied") {
+      return super.acquire(command);
+    }
+
+    return Promise.resolve({
+      status: "already_confirmed" as const,
+      record: {
+        token: "occupied-feed-token",
+        feedId: command.feedId,
+        idempotencyKey: command.idempotencyKey,
+        window: command.window,
+        status: "confirmed" as const,
+        acquiredAt: command.now.toISOString(),
+        leaseExpiresAt: new Date(command.now.getTime() + command.leaseMs).toISOString(),
+        attemptCount: 1,
+        confirmedAt: command.now.toISOString(),
+        publishReceiptMessageId: "already-published-message"
+      }
+    });
+  }
 }
 
 class FailingLeaseStore implements ScheduleLeaseStore {

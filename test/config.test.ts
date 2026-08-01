@@ -5,6 +5,7 @@ import {
 } from "vitest";
 
 import {
+  SCHEDULER_CONFIG_SCHEMA,
   SchedulerConfigError,
   loadSchedulerConfig
 } from "../src/config.js";
@@ -15,6 +16,7 @@ describe("loadSchedulerConfig", () => {
 
     expect(config.serviceName).toBe("nutsnews-worker-feed-scheduler");
     expect(config.serviceVersion).toBe("0.1.0");
+    expect(config.buildRevision).toBe("unknown");
     expect(config.dependencyMode).toBe("test");
     expect(config.dependencies).toEqual({
       databaseConfigured: false,
@@ -34,6 +36,7 @@ describe("loadSchedulerConfig", () => {
   it("accepts production mode when every required dependency is present", () => {
     const config = loadSchedulerConfig({
       NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "production",
+      NUTSNEWS_SCHEDULER_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
       NUTSNEWS_SCHEDULER_DATABASE_URL: "postgres://configured",
       NUTSNEWS_SCHEDULER_BACKEND_API_URL: "https://backend.example.test",
       NUTSNEWS_SCHEDULER_BACKEND_API_TOKEN: "configured",
@@ -44,6 +47,23 @@ describe("loadSchedulerConfig", () => {
 
     expect(config.dependencyMode).toBe("production");
     expect(config.dependencies.rabbitmqConfigured).toBe(true);
+  });
+
+  it("rejects an unknown build revision in production dependency mode", () => {
+    expect(() => loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "production",
+      NUTSNEWS_SCHEDULER_BUILD_REVISION: "UNKNOWN",
+      NUTSNEWS_SCHEDULER_DATABASE_URL: "postgres://configured",
+      NUTSNEWS_SCHEDULER_BACKEND_API_URL: "https://backend.example.test",
+      NUTSNEWS_SCHEDULER_BACKEND_API_TOKEN: "configured",
+      NUTSNEWS_SCHEDULER_RABBITMQ_URL: "amqps://configured"
+    })).toThrow(/BUILD_REVISION.*immutable build/u);
+
+    expect(SCHEDULER_CONFIG_SCHEMA).toContainEqual(expect.objectContaining({
+      name: "NUTSNEWS_SCHEDULER_BUILD_REVISION",
+      requiredInProduction: true,
+      sensitive: false
+    }));
   });
 
   it("keeps shadow mode enabled before backend-owned cutover", () => {
@@ -57,5 +77,15 @@ describe("loadSchedulerConfig", () => {
       NUTSNEWS_ENVIRONMENT: "production",
       NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "test"
     })).toThrow(/DEPENDENCY_MODE must be production/u);
+  });
+
+  it("bounds the build revision exported in metrics", () => {
+    expect(() => loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_BUILD_REVISION: "revision with spaces"
+    })).toThrow(/BUILD_REVISION/u);
+
+    expect(loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_BUILD_REVISION: "abc123-deploy.4"
+    }).buildRevision).toBe("abc123-deploy.4");
   });
 });

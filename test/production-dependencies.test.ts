@@ -99,6 +99,9 @@ describe("production scheduler dependencies", () => {
     });
 
     await service.start();
+    expect((await service.health.readiness()).status).toBe("unhealthy");
+
+    await service.startScheduling();
     const readiness = await service.health.readiness();
     const readinessJson = JSON.stringify(readiness);
     const checkedAtMs = Date.parse(readiness.checkedAt);
@@ -107,7 +110,17 @@ describe("production scheduler dependencies", () => {
     expect(Math.abs(Date.now() - checkedAtMs)).toBeLessThanOrEqual(5_000);
     expect(readinessJson).toContain("backend-api-feed-source");
     expect(readinessJson).toContain("postgres-schedule-lease-store");
+    expect(readinessJson).toContain("rabbitmq-payload-publisher");
     expect(readinessJson).toContain("system-runtime-clock");
+    expect(readiness.checks.map((check) => check.name)).toEqual([
+      "broker-lifecycle",
+      "rabbitmq-publisher",
+      "feed-source",
+      "schedule-lease-store",
+      "runtime-clock",
+      "scheduler-loop",
+      "production-adapters"
+    ]);
     expect(readinessJson).not.toContain("local-feed-source");
     expect(readinessJson).not.toContain("local test");
 
@@ -202,6 +215,7 @@ function productionConfig() {
   return loadSchedulerConfig({
     NUTSNEWS_ENVIRONMENT: "production",
     NUTSNEWS_SCHEDULER_DEPENDENCY_MODE: "production",
+    NUTSNEWS_SCHEDULER_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
     ...productionEnvironment,
     NUTSNEWS_SCHEDULER_CADENCE_MS: "300000",
     NUTSNEWS_SCHEDULER_LEASE_MS: "900000",

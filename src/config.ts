@@ -16,6 +16,7 @@ export interface SchedulerConfigVariable {
 
 export const SCHEDULER_CONFIG_SCHEMA = [
   variable("NUTSNEWS_ENVIRONMENT", "Runtime environment label for logs and metrics.", false, false, "local"),
+  variable("NUTSNEWS_SCHEDULER_BUILD_REVISION", "Immutable source revision exposed as bounded build identity.", true, false, "unknown"),
   variable("NUTSNEWS_SCHEDULER_HTTP_HOST", "Health and metrics bind host.", false, false, "0.0.0.0"),
   variable("NUTSNEWS_SCHEDULER_HTTP_PORT", "Health and metrics bind port.", false, false, "8080"),
   variable("NUTSNEWS_SCHEDULER_DEPENDENCY_MODE", "Use test dependencies locally or require production dependency presence.", false, false, "test"),
@@ -37,6 +38,7 @@ export interface SchedulerConfig {
   readonly serviceVersion: typeof SCHEDULER_SERVICE_VERSION;
   readonly environment: string;
   readonly host: string;
+  readonly buildRevision: string;
   readonly http: {
     readonly host: string;
     readonly port: number;
@@ -89,6 +91,7 @@ export function loadSchedulerConfig(env: NodeJS.ProcessEnv = process.env): Sched
     serviceVersion: SCHEDULER_SERVICE_VERSION,
     environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
     host: nonEmpty(env.HOSTNAME, os.hostname()),
+    buildRevision: parseBuildRevision(env.NUTSNEWS_SCHEDULER_BUILD_REVISION, issues),
     http: {
       host: nonEmpty(env.NUTSNEWS_SCHEDULER_HTTP_HOST, "0.0.0.0"),
       port: parseInteger(env.NUTSNEWS_SCHEDULER_HTTP_PORT, "NUTSNEWS_SCHEDULER_HTTP_PORT", 8080, 0, 65_535, issues)
@@ -103,6 +106,10 @@ export function loadSchedulerConfig(env: NodeJS.ProcessEnv = process.env): Sched
     telemetryLogs: parseTelemetryLogMode(env.NUTSNEWS_SCHEDULER_TELEMETRY_LOGS, issues),
     metricsEnabled: parseBoolean(env.NUTSNEWS_SCHEDULER_METRICS_ENABLED, "NUTSNEWS_SCHEDULER_METRICS_ENABLED", true, issues)
   };
+
+  if (config.dependencyMode === "production" && config.buildRevision.toLowerCase() === "unknown") {
+    issues.push("NUTSNEWS_SCHEDULER_BUILD_REVISION must identify an immutable build when NUTSNEWS_SCHEDULER_DEPENDENCY_MODE=production.");
+  }
 
   if (config.leaseMs <= config.cadenceMs) {
     issues.push("NUTSNEWS_SCHEDULER_LEASE_MS must be greater than NUTSNEWS_SCHEDULER_CADENCE_MS.");
@@ -153,6 +160,17 @@ function nonEmpty(value: string | undefined, fallback: string): string {
 
 function hasValue(value: string | undefined): boolean {
   return value !== undefined && value.trim().length > 0;
+}
+
+function parseBuildRevision(value: string | undefined, issues: string[]): string {
+  const revision = nonEmpty(value, "unknown");
+
+  if (revision.length > 128 || !/^[A-Za-z0-9._/@:+-]+$/u.test(revision)) {
+    issues.push("NUTSNEWS_SCHEDULER_BUILD_REVISION must be at most 128 URL-safe identity characters.");
+    return "unknown";
+  }
+
+  return revision;
 }
 
 function parseDependencyMode(value: string | undefined, issues: string[]): SchedulerDependencyMode {

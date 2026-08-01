@@ -5,8 +5,7 @@ import {
   createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
-  SYSTEM_RUNTIME_CLOCK,
-  type RuntimeTelemetrySink
+  SYSTEM_RUNTIME_CLOCK
 } from "@ramideltoro/nutsnews-worker-runtime";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
 
@@ -14,6 +13,7 @@ import {
   loadSchedulerConfig,
   type SchedulerConfig
 } from "./config.js";
+import type { SchedulerDependencies } from "./dependencies.js";
 import { createSchedulerHttpServer } from "./http.js";
 import { createSchedulerLoop } from "./loop.js";
 import {
@@ -23,6 +23,13 @@ import {
   createSchedulerFailClosedReconciler
 } from "./reconciliation.js";
 import { createSchedulerService } from "./service.js";
+import {
+  bestEffortSchedulerMetricsSink,
+  bestEffortTelemetryFlusher,
+  combineBestEffortTelemetrySinks,
+  schedulerMetricsTelemetrySink
+} from "./telemetry-safety.js";
+import { createLocalSchedulerDependencies } from "./test-doubles.js";
 
 export {
   SCHEDULER_CONFIG_SCHEMA,
@@ -65,6 +72,7 @@ export {
   type SchedulerReconciler
 } from "./reconciliation.js";
 export {
+  SCHEDULER_CYCLE_DURATION_BUCKETS_SECONDS,
   createSchedulerService,
   type SchedulerRunOnceResult,
   type SchedulerService
@@ -103,30 +111,58 @@ export interface SchedulerApplication {
   readonly config: SchedulerConfig;
   start(): Promise<void>;
   stop(): Promise<void>;
+  url(path?: string): string;
 }
 
-export function createSchedulerApplication(config = loadSchedulerConfig()): SchedulerApplication {
+export function createSchedulerApplication(
+  config = loadSchedulerConfig(),
+  dependencyOverride?: SchedulerDependencies
+): SchedulerApplication {
+  const dependencies = dependencyOverride ?? createSchedulerDependencies(config);
   const identity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
-    host: config.host
+    host: config.host,
+    revision: config.buildRevision,
+    deployment: config.shadowMode ? "shadow" : "production",
+    adapter: runtimeAdapterMode(dependencies)
   };
-  const logSink = config.telemetryLogs === "stdout"
+  const logSink = bestEffortTelemetryFlusher(config.telemetryLogs === "stdout"
     ? createJsonRuntimeTelemetrySink({
         identity,
         writer: (line) => {
           console.log(line);
         }
       })
-    : undefined;
-  const metrics = config.metricsEnabled
-    ? createPrometheusRuntimeTelemetrySink({
-        identity
-      })
-    : undefined;
-  const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createSchedulerDependencies(config);
+    : undefined);
+  const metricsOptions = {
+    identity,
+    cardinality: {
+      dependencies: [
+        "scheduler-shell",
+        "scheduler",
+        "lease-store",
+        "broker"
+      ],
+      healthChecks: [
+        "process",
+        "service-started",
+        "broker-lifecycle",
+        "feed-source",
+        "rabbitmq-publisher",
+        "schedule-lease-store",
+        "runtime-clock",
+        "scheduler-loop",
+        "production-adapters"
+      ]
+    },
+    expectedActive: !config.shadowMode
+  } as const;
+  const metrics = bestEffortSchedulerMetricsSink(config.metricsEnabled
+    ? createPrometheusRuntimeTelemetrySink(metricsOptions)
+    : undefined);
+  const telemetry = combineBestEffortTelemetrySinks(logSink, schedulerMetricsTelemetrySink(metrics));
   const reconciliationToken = reconciliationTokenFromEnv();
   const service = createSchedulerService({
     config,
@@ -165,13 +201,13 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
   const shutdown = createRuntimeShutdownController({
     callbacks: [
       async () => {
-        await httpServer.close();
-      },
-      async () => {
         await schedulerLoop.stop();
       },
       async () => {
         await service.stop();
+      },
+      async () => {
+        await httpServer.close();
       }
     ],
     signalSource: process,
@@ -188,15 +224,48 @@ export function createSchedulerApplication(config = loadSchedulerConfig()): Sche
     config,
     async start(): Promise<void> {
       assertPackageCompatibility();
-      await service.start();
       await httpServer.listen();
-      schedulerLoop.start();
       shutdown.start();
+
+      try {
+        await service.start();
+        schedulerLoop.start();
+      } catch (error: unknown) {
+        shutdown.stop();
+        await schedulerLoop.stop().catch(() => undefined);
+        await service.stop().catch(() => undefined);
+        await httpServer.close().catch(() => undefined);
+        throw error;
+      }
     },
     async stop(): Promise<void> {
       await shutdown.trigger("manual");
-    }
+    },
+    url: (path = "/") => httpServer.url(path)
   };
+}
+
+export function createSchedulerApplicationDependencies(): SchedulerDependencies {
+  return {
+    ...createLocalSchedulerDependencies(),
+    clockKind: "system",
+    clock: SYSTEM_RUNTIME_CLOCK
+  };
+}
+
+function runtimeAdapterMode(dependencies: SchedulerDependencies): "in_memory" | "mixed" | "production" {
+  const unique = new Set([
+    dependencies.clockKind === "system" ? "production" : "in_memory",
+    dependencies.feedSource.adapterKind === "backend-api" ? "production" : "in_memory",
+    dependencies.leaseStore.adapterKind === "postgres" ? "production" : "in_memory",
+    dependencies.brokerKind === "rabbitmq" ? "production" : "in_memory"
+  ]);
+
+  if (unique.size !== 1) {
+    return "mixed";
+  }
+
+  return unique.values().next().value === "production" ? "production" : "in_memory";
 }
 
 function reconciliationTokenFromEnv(): string | undefined {
@@ -205,24 +274,6 @@ function reconciliationTokenFromEnv(): string | undefined {
   const token = serviceToken !== undefined && serviceToken.length > 0 ? serviceToken : globalToken;
 
   return token === undefined || token.length === 0 ? undefined : token;
-}
-
-function combineTelemetrySinks(
-  ...sinks: readonly (RuntimeTelemetrySink | undefined)[]
-): RuntimeTelemetrySink | undefined {
-  const configured = sinks.filter((sink): sink is RuntimeTelemetrySink => sink !== undefined);
-
-  if (configured.length === 0) {
-    return undefined;
-  }
-
-  return {
-    emit: async (event) => {
-      for (const sink of configured) {
-        await sink.emit(event);
-      }
-    }
-  };
 }
 
 function assertPackageCompatibility(): void {

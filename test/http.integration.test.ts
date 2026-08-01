@@ -65,7 +65,13 @@ describe("scheduler HTTP endpoints", () => {
 
     const metricsResponse = await fetch(activeServer.url("/metrics"));
     expect(metricsResponse.status).toBe(200);
-    expect(await metricsResponse.text()).toContain("nutsnews_worker_dependency_duration_ms");
+    const metricsBody = await metricsResponse.text();
+    expect(metricsBody).toContain("nutsnews_worker_build_info");
+    expect(metricsBody).toContain("nutsnews_worker_expected_active");
+    expect(metricsBody).toContain("nutsnews_worker_last_success_timestamp_seconds");
+    expect(metricsBody.match(/^# TYPE nutsnews_worker_health_probe gauge$/gmu)).toHaveLength(1);
+    expect(metricsBody).not.toMatch(/^# TYPE nutsnews_worker_health gauge$/mu);
+    expect(metricsBody).not.toMatch(/^nutsnews_worker_health\{/mu);
 
     const schemaResponse = await fetch(activeServer.url("/config-schema"));
     expect(schemaResponse.status).toBe(200);
@@ -119,6 +125,32 @@ describe("scheduler HTTP endpoints", () => {
       writesPerformed: false,
       productionVisibilityEnabled: false
     });
+
+    await service.stop();
+  });
+
+  it("returns an empty metrics body when metrics are disabled", async () => {
+    const config = loadSchedulerConfig({
+      NUTSNEWS_SCHEDULER_HTTP_HOST: "127.0.0.1",
+      NUTSNEWS_SCHEDULER_HTTP_PORT: "0",
+      NUTSNEWS_SCHEDULER_TELEMETRY_LOGS: "silent",
+      NUTSNEWS_SCHEDULER_METRICS_ENABLED: "false"
+    });
+    const service = createSchedulerService({
+      config,
+      dependencies: createLocalSchedulerDependencies()
+    });
+    activeServer = createSchedulerHttpServer({
+      config,
+      service
+    });
+
+    await service.start();
+    await activeServer.listen();
+
+    const response = await fetch(activeServer.url("/metrics"));
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("");
 
     await service.stop();
   });

@@ -40,6 +40,7 @@ The value-free configuration schema lives in `src/config.ts` and is exposed at `
 Important variables:
 
 - `NUTSNEWS_SCHEDULER_DEPENDENCY_MODE`: `test` or `production`
+- `NUTSNEWS_SCHEDULER_BUILD_REVISION`: bounded immutable commit or image revision exported in build telemetry
 - `NUTSNEWS_SCHEDULER_DATABASE_URL`
 - `NUTSNEWS_SCHEDULER_BACKEND_API_URL`
 - `NUTSNEWS_SCHEDULER_BACKEND_API_TOKEN`
@@ -60,6 +61,10 @@ Production mode uses only:
 
 Startup and readiness fail closed unless all three external dependencies are available. Readiness names `backend-api-feed-source`, `postgres-schedule-lease-store`, and `rabbitmq`, and requires the system clock to be within five seconds of wall time. Responses contain status, adapter names, and bounded error classes only—never credentials, feed payloads, URLs, or response bodies.
 
+Production dependency mode also requires `NUTSNEWS_SCHEDULER_BUILD_REVISION` to identify an immutable build. The `unknown` local-development sentinel is rejected before production-mode startup.
+
+The application binds its diagnostic HTTP server and signal handlers before broker initialization and before launching an immediate, non-overlapping scheduling loop, then schedules the next run only after the current run finishes. While broker startup is pending, liveness remains queryable and startup/readiness remain unhealthy. Production readiness requires a successful loop cycle within three cadences and the backend API, PostgreSQL lease store, RabbitMQ publisher, and system clock to identify themselves as the approved production adapters. Shadow mode exports `expected_active=0` for paging and ownership decisions, but it does not override dependency or loop readiness; a production-mode shadow is ready only while its real adapters and scheduling loop are usable. The container healthcheck uses `/live` so ownership changes do not restart a live diagnostic shell. Local test mode can still become ready with deterministic doubles. The application uses the system clock; the manual clock remains test-only.
+
 ## Scheduling Behavior
 
 The scheduler evaluates active feed definitions with an injectable clock:
@@ -73,6 +78,7 @@ The scheduler evaluates active feed definitions with an injectable clock:
 - the lease is finalized as `confirmed` only after publisher confirmation;
 - failed publishes mark the lease `failed`, allowing a later retry;
 - already confirmed windows are not published again.
+- telemetry delivery is fail-safe per configured sink: one rejecting log or metrics sink cannot starve another sink, fail scheduling, reopen a lease, or otherwise mutate scheduling state.
 
 The deployed loop runs once immediately after startup, then waits one configured cadence after each completed run. Runs never overlap. The backend shadow deployment currently bounds each run to one newly acquired feed window; the durable lease prevents repeated publication of the same feed/window across restarts or concurrent replicas.
 
@@ -91,6 +97,10 @@ The scheduler proof suite covers:
 - multi-replica PostgreSQL and RabbitMQ integration.
 
 Failure telemetry identifies `feedId`, `windowStart`, `attemptCount` when available, `idempotencyKey` for lease failures, and the failing dependency (`lease-store` or `broker`) without recording secret values.
+
+`/metrics` also exports bounded build revision, service version, deployment mode, aggregate adapter mode, `expected_active`, explicit `nutsnews_worker_health_probe` liveness/startup/readiness state, distinct scheduler-loop active/fresh states, the last successful scheduling-cycle timestamp, and a fixed-bucket `nutsnews_worker_scheduler_cycle_duration_seconds` histogram. Probe series begin with truthful pre-start values and refresh after scheduling cycles as the service starts, becomes ready, becomes stale, and stops. Health evaluation events remain in structured logs, while the shared runtime's overlapping `nutsnews_worker_health` family is suppressed on the metrics branch so `nutsnews_worker_health_probe` is the sole probe family. Duration-less dependency events likewise remain available to structured logs but are not forwarded to the legacy runtime metric adapter as fabricated zero-latency observations; measured `runtime.dependency.observed` events are the only dependency-latency path. Shadow deployments export `expected_active=0`, allowing production ownership alerts to ignore them without changing readiness. When metrics are disabled, `/metrics` is intentionally empty.
+
+The container publishing workflow injects the immutable Git SHA into `NUTSNEWS_SCHEDULER_BUILD_REVISION` as well as the OCI revision label. A local test-mode image built without a revision remains explicitly `unknown`; production dependency mode rejects that sentinel.
 
 The PostgreSQL/RabbitMQ integration test skips unless both service URLs are present:
 

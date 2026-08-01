@@ -4,8 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import {
-  runtimeHealthEndpointResponse,
-  type PrometheusRuntimeTelemetrySink
+  runtimeHealthEndpointResponse
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
@@ -18,11 +17,12 @@ import {
   type SchedulerReconciler
 } from "./reconciliation.js";
 import type { SchedulerService } from "./service.js";
+import type { SchedulerMetricsSink } from "./telemetry-safety.js";
 
 export interface SchedulerHttpServerOptions {
   readonly config: SchedulerConfig;
   readonly service: SchedulerService;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: SchedulerMetricsSink;
   readonly reconciler?: SchedulerReconciler;
   readonly reconciliationToken?: string;
 }
@@ -103,7 +103,14 @@ async function routeRequest(
       writeHealth(response, await options.service.health.readiness());
       return;
     case "/metrics":
-      writeText(response, 200, options.metrics?.collect() ?? "", "text/plain; version=0.0.4; charset=utf-8");
+      writeText(
+        response,
+        200,
+        options.metrics === undefined
+          ? ""
+          : `${collectMetrics(options.metrics)}${options.service.collectOperationalMetrics()}`,
+        "text/plain; version=0.0.4; charset=utf-8"
+      );
       return;
     case "/config-schema":
       writeJson(response, 200, {
@@ -116,6 +123,14 @@ async function routeRequest(
       writeJson(response, 404, {
         status: "not-found"
       });
+  }
+}
+
+function collectMetrics(metrics: SchedulerMetricsSink): string {
+  try {
+    return metrics.collect();
+  } catch {
+    return "";
   }
 }
 
